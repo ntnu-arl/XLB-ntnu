@@ -89,6 +89,48 @@ def save_image(fld, timestep=None, prefix=None, **kwargs):
     kwargs.pop("cmap", None)
     plt.imsave(fname + ".png", fld.T, cmap=cm.nipy_spectral, origin="lower", **kwargs)
 
+def show_image(fld, timestep=None, prefix=None, **kwargs):
+    """
+    Save an image of a field at a given timestep.
+
+    Parameters
+    ----------
+    timestep : int
+        The timestep at which the field is being saved.
+    fld : jax.numpy.ndarray
+        The field to be saved. This should be a 2D or 3D JAX array. If the field is 3D, the magnitude of the field will be calculated and saved.
+    prefix : str, optional
+        A prefix to be added to the filename. The filename will be the name of the main script file by default.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    This function saves the field as an image in the PNG format.
+    The filename is based on the name of the main script file, the provided prefix, and the timestep number.
+    If the field is 3D, the magnitude of the field is calculated and saved.
+    The image is saved with the 'nipy_spectral' colormap and the origin set to 'lower'.
+    """
+    if prefix is None:
+        fname = os.path.basename(__main__.__file__)
+        fname = os.path.splitext(fname)[0]
+    else:
+        fname = prefix
+
+    if timestep is not None:
+        fname = fname + "_" + str(timestep).zfill(4)
+
+    if len(fld.shape) > 3:
+        raise ValueError("The input field should be 2D!")
+    if len(fld.shape) == 3:
+        fld = np.sqrt(fld[0, ...] ** 2 + fld[0, ...] ** 2)
+
+    plt.clf()
+    plt.imshow(fld.T, cmap=cm.nipy_spectral, origin="lower", **kwargs)
+    plt.show(block=False)
+
 
 def save_fields_vtk(fields, timestep, output_dir=".", prefix="fields"):
     """

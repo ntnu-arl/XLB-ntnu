@@ -1,6 +1,7 @@
 import xlb
 import trimesh
 import time
+from mpl_toolkits import mplot3d
 from xlb.compute_backend import ComputeBackend
 from xlb.precision_policy import PrecisionPolicy
 from xlb.grid import grid_factory
@@ -13,7 +14,7 @@ from xlb.operator.boundary_condition import (
 )
 from xlb.operator.force.momentum_transfer import MomentumTransfer
 from xlb.operator.macroscopic import Macroscopic
-from xlb.utils import save_fields_vtk, save_image
+from xlb.utils import save_fields_vtk, save_image, show_image
 import warp as wp
 import numpy as np
 import jax.numpy as jnp
@@ -23,18 +24,18 @@ import matplotlib.pyplot as plt
 # -------------------------- Simulation Setup --------------------------
 
 # Grid parameters
-grid_size_x, grid_size_y, grid_size_z = 512, 128, 128
-grid_shape = (grid_size_x, grid_size_y, grid_size_z)
+grid_size_x, grid_size_y, grid_size_z = 128*2, 128*1, 128*1 # Adjust as needed for your mesh and computational resources
+grid_shape = (grid_size_x, grid_size_y, grid_size_z) 
 
 # Simulation Configuration
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
 velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
-wind_speed = 0.02
+wind_speed = 0.1  # Prescribed velocity at the inlet (in lattice units)    
 num_steps = 100000
 print_interval = 1000
-post_process_interval = 1000
+post_process_interval = 100
 
 # Physical Parameters
 Re = 50000.0
@@ -73,8 +74,10 @@ walls = [box["bottom"][i] + box["top"][i] + box["front"][i] + box["back"][i] for
 walls = np.unique(np.array(walls), axis=-1).tolist()
 
 # Load the mesh (replace with your own mesh)
-stl_filename = "../stl-files/DrivAer-Notchback.stl"
+stl_filename = "./data/Sparrow.stl"
 mesh = trimesh.load_mesh(stl_filename, process=False)
+mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1]))  # Rotate to align with flow direction
+# mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(0), [0, 1, 0]))  # Rotate to align with flow direction
 mesh_vertices = mesh.vertices
 
 # Transform the mesh points to align with the grid
@@ -84,17 +87,34 @@ length_phys_unit = mesh_extents.max()
 length_lbm_unit = grid_shape[0] / 4
 dx = length_phys_unit / length_lbm_unit
 mesh_vertices = mesh_vertices / dx
-shift = np.array([grid_shape[0] / 4, (grid_shape[1] - mesh_extents[1] / dx) / 2, 0.0])
-car_vertices = mesh_vertices + shift
+shift = np.array([grid_shape[0] / 4, (grid_shape[1] - mesh_extents[1] / dx) / 2, (grid_shape[2]- mesh_extents[2] / dx) / 2])
+mesh_vertices += shift
 car_cross_section = np.prod(mesh_extents[1:]) / dx**2
 
+print(f"Mesh extents (in physical units): {mesh_extents}")
+print(f"Car cross-section (in lattice units): {car_cross_section}")
+
+# convert face indices to Nx3 coordinate arrays
+viz_inlet = np.vstack(box_no_edge["left"]).T   # shape (N, 3)
+viz_outlet = np.vstack(box_no_edge["right"]).T
+viz_walls = np.vstack([
+    np.vstack(box["bottom"]).T,
+    np.vstack(box["top"]).T,
+    np.vstack(box["front"]).T,
+    np.vstack(box["back"]).T,
+])
+
+inlet_pc = trimesh.points.PointCloud(viz_inlet, colors=[255, 0, 0, 120])    # red
+outlet_pc = trimesh.points.PointCloud(viz_outlet, colors=[0, 255, 0, 120])  # green
+walls_pc = trimesh.points.PointCloud(viz_walls, colors=[0, 0, 255, 120])    # blue
+
+mesh.vertices = mesh_vertices
 
 bc_left = RegularizedBC("velocity", prescribed_value=(wind_speed, 0.0, 0.0), indices=inlet)
 bc_walls = FullwayBounceBackBC(indices=walls)
 bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
-bc_car = HalfwayBounceBackBC(mesh_vertices=car_vertices)
-boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_car]
-
+bc_mesh = HalfwayBounceBackBC(mesh_vertices=mesh_vertices)
+boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_mesh]
 
 # Setup Stepper
 stepper = IncompressibleNavierStokesStepper(
@@ -106,11 +126,24 @@ stepper = IncompressibleNavierStokesStepper(
 # Prepare Fields
 f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
 
+# Convert to numpy if needed
+bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
+
+bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
+print(bc_cells)
+bc_points = trimesh.points.PointCloud(
+    bc_cells,
+    colors=[255, 0, 0, 200],
+)
+
+print(f"Number of boundary cells on the mesh: {len(bc_cells)}")
+scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points])
+scene.show()
 
 # -------------------------- Helper Functions --------------------------
 
 
-def plot_drag_coefficient(time_steps, drag_coefficients):
+def plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients):
     """
     Plot the drag coefficient with various moving averages.
 
@@ -121,13 +154,15 @@ def plot_drag_coefficient(time_steps, drag_coefficients):
     # Convert lists to numpy arrays for processing
     time_steps_np = np.array(time_steps)
     drag_coefficients_np = np.array(drag_coefficients)
+    lift_coefficients_np = np.array(lift_coefficients)
 
     # Define moving average windows
     windows = [10, 100, 1000, 10000, 100000]
     labels = ["MA 10", "MA 100", "MA 1,000", "MA 10,000", "MA 100,000"]
 
     plt.figure(figsize=(12, 8))
-    plt.plot(time_steps_np, drag_coefficients_np, label="Raw", alpha=0.5)
+    plt.plot(time_steps_np, drag_coefficients_np, label="Raw Drag Coefficient", alpha=0.5)
+    plt.plot(time_steps_np, lift_coefficients_np, label="Raw Lift Coefficient", alpha=0.5)
 
     for window, label in zip(windows, labels):
         if len(drag_coefficients_np) >= window:
@@ -139,7 +174,7 @@ def plot_drag_coefficient(time_steps, drag_coefficients):
     plt.xlabel("Time step")
     plt.ylabel("Drag coefficient")
     plt.title("Drag Coefficient Over Time with Moving Averages")
-    plt.savefig("drag_coefficient_ma.png")
+    plt.savefig("out/drag_coefficient_ma.png")
     plt.close()
 
 
@@ -191,11 +226,11 @@ def post_process(
     fields = {"u_magnitude": u_magnitude}
 
     # Save fields in VTK format
-    save_fields_vtk(fields, timestep=step)
+    # save_fields_vtk(fields, timestep=step, prefix="out/windtunnel")
 
     # Save the u_magnitude slice at the mid y-plane
     mid_y = grid_shape[1] // 2
-    save_image(fields["u_magnitude"][:, mid_y, :], timestep=step)
+    show_image(fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel")
 
     # Compute lift and drag
     boundary_force = momentum_transfer(f_0, f_1, bc_mask, missing_mask)
@@ -208,7 +243,7 @@ def post_process(
     time_steps.append(step)
 
     # Plot drag coefficient
-    plot_drag_coefficient(time_steps, drag_coefficients)
+    plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients)
 
 
 # Setup Momentum Transfer for Force Calculation
