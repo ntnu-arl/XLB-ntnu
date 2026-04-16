@@ -32,13 +32,13 @@ compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
 velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
-wind_speed = 0.1  # Prescribed velocity at the inlet (in lattice units)    
+wind_speed = 0.01  # Prescribed velocity at the inlet (in lattice units)    
 num_steps = 100000
 print_interval = 1000
 post_process_interval = 100
 
 # Physical Parameters
-Re = 50000.0
+Re = 80000.0
 clength = grid_size_x - 1
 visc = wind_speed * clength / Re
 omega = 1.0 / (3.0 * visc + 0.5)
@@ -77,8 +77,9 @@ walls = np.unique(np.array(walls), axis=-1).tolist()
 stl_filename = "./data/Sparrow.stl"
 mesh = trimesh.load_mesh(stl_filename, process=False)
 mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1]))  # Rotate to align with flow direction
-# mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(0), [0, 1, 0]))  # Rotate to align with flow direction
+mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(10), [0, 1, 0]))  # Rotate to align with flow direction
 mesh_vertices = mesh.vertices
+mesh_indices = mesh.faces
 
 # Transform the mesh points to align with the grid
 mesh_vertices -= mesh_vertices.min(axis=0)
@@ -128,16 +129,23 @@ f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
 
 # Convert to numpy if needed
 bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
-
-bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
-print(bc_cells)
-bc_points = trimesh.points.PointCloud(
-    bc_cells,
-    colors=[255, 0, 0, 200],
+bc_cells_solid = np.stack(np.where(bc_mask_np == 255), axis=1)
+print(bc_cells_solid.shape)
+bc_points_solid = trimesh.points.PointCloud(
+    bc_cells_solid,
+    colors=[255, 255, 255, 200],
 )
 
+bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
+print(bc_cells.shape)
+bc_points = trimesh.points.PointCloud(
+    bc_cells,
+    colors=[0, 0, 0, 200],
+)
+
+print(f"Number of solid boundary cells on the mesh: {len(bc_cells_solid)}")
 print(f"Number of boundary cells on the mesh: {len(bc_cells)}")
-scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points])
+scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points_solid, bc_points])
 scene.show()
 
 # -------------------------- Helper Functions --------------------------
@@ -169,7 +177,7 @@ def plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients):
             ma = np.convolve(drag_coefficients_np, np.ones(window) / window, mode="valid")
             plt.plot(time_steps_np[window - 1 :], ma, label=label)
 
-    plt.ylim(-1.0, 1.0)
+    plt.ylim(-2.0, 2.0)
     plt.legend()
     plt.xlabel("Time step")
     plt.ylabel("Drag coefficient")
