@@ -67,17 +67,18 @@ class MeshBoundaryMasker(Operator):
             verts: wp.mat33f,  # triangle vertices
             normal: wp.vec3f,  # triangle normal
         ):
+            #corner = wp.vec3f(2.0*float(normal[0] > 0.0)-1.0, 2.0*float(normal[1] > 0.0)-1.0, 2.0*float(normal[2] > 0.0)-1.0)
             corner = wp.vec3f(float(normal[0] > 0.0), float(normal[1] > 0.0), float(normal[2] > 0.0))
-
             dist1 = wp.dot(normal, corner - verts[0])
             dist2 = wp.dot(normal, wp.vec3f(1.0, 1.0, 1.0) - corner - verts[0])
 
-            edges = wp.transpose(wp.matrix_from_rows(verts[1] - verts[0], verts[2] - verts[1], verts[0] - verts[2]))
+            edges = wp.mat33f(wp.matrix_from_rows(verts[1] - verts[0], verts[2] - verts[1], verts[0] - verts[2]))
             normal_edge0 = wp.mat33f(0.0)
             normal_edge1 = wp.mat33f(0.0)
             dist_edge = wp.mat33f(0.0)
 
             for axis0 in range(0, 3):
+                axis1 = (axis0 + 1) % 3
                 axis2 = (axis0 + 2) % 3
 
                 sgn = 1.0
@@ -85,11 +86,11 @@ class MeshBoundaryMasker(Operator):
                     sgn = -1.0
 
                 for i in range(0, 3):
-                    normal_edge0[i][axis0] = -1.0 * sgn * edges[i][axis0]
+                    normal_edge0[i][axis0] = -1.0 * sgn * edges[i][axis1]
                     normal_edge1[i][axis0] = sgn * edges[i][axis0]
 
                     dist_edge[i][axis0] = (
-                        -1.0 * (normal_edge0[i][axis0] * verts[i][axis0] + normal_edge1[i][axis0] * verts[i][axis0])
+                        -1.0 * (normal_edge0[i][axis0] * verts[i][axis0] + normal_edge1[i][axis0] * verts[i][axis1])
                         + wp.max(0.0, normal_edge0[i][axis0])
                         + wp.max(0.0, normal_edge1[i][axis0])
                     )
@@ -128,14 +129,13 @@ class MeshBoundaryMasker(Operator):
         @wp.func
         def mesh_voxel_intersect(mesh_id: wp.uint64, low: wp.vec3):
             query = wp.mesh_query_aabb(mesh_id, low, low + wp.vec3f(1.0, 1.0, 1.0))
-
             for f in query:
                 v0 = wp.mesh_eval_position(mesh_id, f, 1.0, 0.0)
                 v1 = wp.mesh_eval_position(mesh_id, f, 0.0, 1.0)
                 v2 = wp.mesh_eval_position(mesh_id, f, 0.0, 0.0)
                 normal = wp.mesh_eval_face_normal(mesh_id, f)
 
-                v = wp.transpose(wp.matrix_from_rows(v0, v1, v2))
+                v = wp.mat33f(wp.matrix_from_rows(v0, v1, v2))
 
                 # TODO: run this on triangles in advance
                 dist1, dist2, normal_edge0, normal_edge1, dist_edge = pre_compute(verts=v, normal=normal)
