@@ -20,134 +20,6 @@ import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-
-# -------------------------- Simulation Setup --------------------------
-
-# Grid parameters
-grid_size_x, grid_size_y, grid_size_z = 128*2, 128*1, 128*1 # Adjust as needed for your mesh and computational resources
-grid_shape = (grid_size_x, grid_size_y, grid_size_z) 
-
-# Simulation Configuration
-compute_backend = ComputeBackend.WARP
-precision_policy = PrecisionPolicy.FP32FP32
-
-velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
-wind_speed = 0.01  # Prescribed velocity at the inlet (in lattice units)    
-num_steps = 100000
-print_interval = 1000
-post_process_interval = 100
-
-# Physical Parameters
-Re = 80000.0
-clength = grid_size_x - 1
-visc = wind_speed * clength / Re
-omega = 1.0 / (3.0 * visc + 0.5)
-
-# Print simulation info
-print("\n" + "=" * 50 + "\n")
-print("Simulation Configuration:")
-print(f"Grid size: {grid_size_x} x {grid_size_y} x {grid_size_z}")
-print(f"Backend: {compute_backend}")
-print(f"Velocity set: {velocity_set}")
-print(f"Precision policy: {precision_policy}")
-print(f"Prescribed velocity: {wind_speed}")
-print(f"Reynolds number: {Re}")
-print(f"Max iterations: {num_steps}")
-print("\n" + "=" * 50 + "\n")
-
-# Initialize XLB
-xlb.init(
-    velocity_set=velocity_set,
-    default_backend=compute_backend,
-    default_precision_policy=precision_policy,
-)
-
-# Create Grid
-grid = grid_factory(grid_shape, compute_backend=compute_backend)
-
-# Bounding box indices
-box = grid.bounding_box_indices()
-box_no_edge = grid.bounding_box_indices(remove_edges=True)
-inlet = box_no_edge["left"]
-outlet = box_no_edge["right"]
-walls = [box["bottom"][i] + box["top"][i] + box["front"][i] + box["back"][i] for i in range(velocity_set.d)]
-walls = np.unique(np.array(walls), axis=-1).tolist()
-
-# Load the mesh (replace with your own mesh)
-stl_filename = "./data/Sparrow.stl"
-mesh = trimesh.load_mesh(stl_filename, process=False)
-mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1]))  # Rotate to align with flow direction
-mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(10), [0, 1, 0]))  # Rotate to align with flow direction
-mesh_vertices = mesh.vertices
-mesh_indices = mesh.faces
-
-# Transform the mesh points to align with the grid
-mesh_vertices -= mesh_vertices.min(axis=0)
-mesh_extents = mesh_vertices.max(axis=0)
-length_phys_unit = mesh_extents.max()
-length_lbm_unit = grid_shape[0] / 4
-dx = length_phys_unit / length_lbm_unit
-mesh_vertices = mesh_vertices / dx
-shift = np.array([grid_shape[0] / 4, (grid_shape[1] - mesh_extents[1] / dx) / 2, (grid_shape[2]- mesh_extents[2] / dx) / 2])
-mesh_vertices += shift
-car_cross_section = np.prod(mesh_extents[1:]) / dx**2
-
-print(f"Mesh extents (in physical units): {mesh_extents}")
-print(f"Car cross-section (in lattice units): {car_cross_section}")
-
-# convert face indices to Nx3 coordinate arrays
-viz_inlet = np.vstack(box_no_edge["left"]).T   # shape (N, 3)
-viz_outlet = np.vstack(box_no_edge["right"]).T
-viz_walls = np.vstack([
-    np.vstack(box["bottom"]).T,
-    np.vstack(box["top"]).T,
-    np.vstack(box["front"]).T,
-    np.vstack(box["back"]).T,
-])
-
-inlet_pc = trimesh.points.PointCloud(viz_inlet, colors=[255, 0, 0, 120])    # red
-outlet_pc = trimesh.points.PointCloud(viz_outlet, colors=[0, 255, 0, 120])  # green
-walls_pc = trimesh.points.PointCloud(viz_walls, colors=[0, 0, 255, 120])    # blue
-
-mesh.vertices = mesh_vertices
-
-bc_left = RegularizedBC("velocity", prescribed_value=(wind_speed, 0.0, 0.0), indices=inlet)
-bc_walls = FullwayBounceBackBC(indices=walls)
-bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
-bc_mesh = HalfwayBounceBackBC(mesh_vertices=mesh_vertices)
-boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_mesh]
-
-# Setup Stepper
-stepper = IncompressibleNavierStokesStepper(
-    grid=grid,
-    boundary_conditions=boundary_conditions,
-    collision_type="KBC",
-)
-
-# Prepare Fields
-f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
-
-# Convert to numpy if needed
-bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
-bc_cells_solid = np.stack(np.where(bc_mask_np == 255), axis=1)
-print(bc_cells_solid.shape)
-bc_points_solid = trimesh.points.PointCloud(
-    bc_cells_solid,
-    colors=[255, 255, 255, 200],
-)
-
-bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
-print(bc_cells.shape)
-bc_points = trimesh.points.PointCloud(
-    bc_cells,
-    colors=[0, 0, 0, 200],
-)
-
-print(f"Number of solid boundary cells on the mesh: {len(bc_cells_solid)}")
-print(f"Number of boundary cells on the mesh: {len(bc_cells)}")
-scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points_solid, bc_points])
-scene.show()
-
 # -------------------------- Helper Functions --------------------------
 
 
@@ -229,9 +101,10 @@ def post_process(
 
     # Remove boundary cells
     u = u[:, 1:-1, 1:-1, 1:-1]
-    u_magnitude = jnp.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2)
+    u_magnitude = jnp.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2)/voxel_size  # Convert back to physical units (m/s)
 
     fields = {"u_magnitude": u_magnitude}
+    fields["rho"] = rho
 
     # Save fields in VTK format
     # save_fields_vtk(fields, timestep=step, prefix="out/windtunnel")
@@ -239,13 +112,14 @@ def post_process(
     # Save the u_magnitude slice at the mid y-plane
     mid_y = grid_shape[1] // 2
     show_image(fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel")
+    # save_image(fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel")
 
     # Compute lift and drag
     boundary_force = momentum_transfer(f_0, f_1, bc_mask, missing_mask)
     drag = boundary_force[0]  # x-direction
     lift = boundary_force[2]
-    cd = 2.0 * drag / (wind_speed**2 * car_cross_section)
-    cl = 2.0 * lift / (wind_speed**2 * car_cross_section)
+    cd = 2.0 * drag / (wind_speed**2 * mesh_cross_section)
+    cl = 2.0 * lift / (wind_speed**2 * mesh_cross_section)
     drag_coefficients.append(cd)
     lift_coefficients.append(cl)
     time_steps.append(step)
@@ -253,10 +127,138 @@ def post_process(
     # Plot drag coefficient
     plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients)
 
+# -------------------------- Simulation Setup --------------------------
+
+# Grid parameters
+grid_size_x, grid_size_y, grid_size_z = 128*2, 128*1, 128*1 # Adjust as needed for your mesh and computational resources
+grid_shape = (grid_size_x, grid_size_y, grid_size_z) 
+
+# Simulation Configuration
+compute_backend = ComputeBackend.WARP
+precision_policy = PrecisionPolicy.FP32FP32
+
+velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
+voxel_size = 0.006 # m
+wind_speed = 5.0  # Prescribed velocity at the inlet (in m/s)
+stl_filename = "./data/Sparrow.stl"    
+
+num_steps = 100000
+print_interval = 1000
+post_process_interval = 10
+
+# Physical Parameters
+Re = 80000.0
+clength = (grid_size_x-1) * voxel_size  # Characteristic length (in physical units, e.g., m)
+visc = wind_speed * clength / Re
+omega = 1.0 / (3.0 * visc + 0.5)
+
+# Print simulation info
+print("\n" + "=" * 50 + "\n")
+print("Simulation Configuration:")
+print(f"Grid size: {grid_size_x} x {grid_size_y} x {grid_size_z}")
+print(f"Grid dimensions: {grid_size_x*voxel_size} x {grid_size_y*voxel_size} x {grid_size_z*voxel_size}")
+print(f"Number of cells: {grid_size_x*grid_size_y*grid_size_z}")
+print(f"Backend: {compute_backend}")
+print(f"Velocity set: {velocity_set}")
+print(f"Precision policy: {precision_policy}")
+print(f"Prescribed velocity: {wind_speed}")
+print(f"Reynolds number: {Re}")
+print(f"Max iterations: {num_steps}")
+print("\n" + "=" * 50 + "\n")
+
+# Initialize XLB
+xlb.init(
+    velocity_set=velocity_set,
+    default_backend=compute_backend,
+    default_precision_policy=precision_policy,
+)
+
+# Create Grid
+grid = grid_factory(grid_shape, compute_backend=compute_backend)
+
+# Bounding box indices
+box = grid.bounding_box_indices()
+box_no_edge = grid.bounding_box_indices(remove_edges=True)
+inlet = box_no_edge["left"]
+outlet = box_no_edge["right"]
+walls = [box["bottom"][i] + box["top"][i] + box["front"][i] + box["back"][i] for i in range(velocity_set.d)]
+walls = np.unique(np.array(walls), axis=-1).tolist()
+
+# Load the mesh (replace with your own mesh)
+mesh = trimesh.load_mesh(stl_filename, process=False)
+mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1]))  # Rotate to align with flow direction
+mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(10), [0, 1, 0]))  # Rotate to align with flow direction
+mesh_vertices = mesh.vertices
+mesh_indices = mesh.faces
+
+# Transform the mesh points to align with the grid
+mesh_vertices -= mesh_vertices.min(axis=0)
+mesh_extents = mesh_vertices.max(axis=0) # mm
+
+length_phys_unit = mesh_extents.max()
+scale = 1000*voxel_size
+mesh_vertices = mesh_vertices  / scale  # Now in physical units (e.g., m)
+shift = np.array([grid_shape[0] / 4, (grid_shape[1] - mesh_extents[1] / scale) / 2, (grid_shape[2]- mesh_extents[2] / scale) / 2])
+mesh_vertices += shift
+mesh_cross_section = np.prod(mesh_extents[1:]) / scale**2
+
+print(f"Mesh extents (in physical units): {mesh_extents}")
+print(f"Mesh cross-section (in lattice units): {mesh_cross_section}")
+
+# convert face indices to Nx3 coordinate arrays
+viz_inlet = np.vstack(box_no_edge["left"]).T   # shape (N, 3)
+viz_outlet = np.vstack(box_no_edge["right"]).T
+viz_walls = np.vstack([
+    np.vstack(box["bottom"]).T,
+    np.vstack(box["top"]).T,
+    np.vstack(box["front"]).T,
+    np.vstack(box["back"]).T,
+])
+
+inlet_pc = trimesh.points.PointCloud(viz_inlet, colors=[255, 0, 0, 120])    # red
+outlet_pc = trimesh.points.PointCloud(viz_outlet, colors=[0, 255, 0, 120])  # green
+walls_pc = trimesh.points.PointCloud(viz_walls, colors=[0, 0, 255, 120])    # blue
+
+mesh.vertices = mesh_vertices
+
+bc_left = RegularizedBC("velocity", prescribed_value=(wind_speed*voxel_size, 0.0, 0.0), indices=inlet)
+bc_walls = ExtrapolationOutflowBC(indices=walls) #FullwayBounceBackBC(indices=walls)
+bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
+bc_mesh = HalfwayBounceBackBC(mesh_vertices=mesh_vertices)
+boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_mesh]
+
+# Setup Stepper
+stepper = IncompressibleNavierStokesStepper(
+    grid=grid,
+    boundary_conditions=boundary_conditions,
+    collision_type="KBC",
+)
+
+# Prepare Fields
+f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
+
+# Convert to numpy if needed
+bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
+bc_cells_solid = np.stack(np.where(bc_mask_np == 255), axis=1)
+bc_points_solid = trimesh.points.PointCloud(
+    bc_cells_solid,
+    colors=[255, 255, 255, 200],
+)
+
+bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
+bc_points = trimesh.points.PointCloud(
+    bc_cells,
+    colors=[0, 0, 0, 200],
+)
+
+print(f"Number of solid boundary cells on the mesh: {len(bc_cells_solid)}")
+print(f"Number of boundary cells on the mesh: {len(bc_cells)}")
+scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points_solid, bc_points])
+scene.show()
 
 # Setup Momentum Transfer for Force Calculation
-bc_car = boundary_conditions[-1]
-momentum_transfer = MomentumTransfer(bc_car, compute_backend=compute_backend)
+bc_mesh = boundary_conditions[-1]
+momentum_transfer = MomentumTransfer(bc_mesh, compute_backend=compute_backend)
 
 # Define Macroscopic Calculation
 macro = Macroscopic(
@@ -298,7 +300,7 @@ for step in range(num_steps):
             missing_mask,
             bc_mask,
             wind_speed,
-            car_cross_section,
+            mesh_cross_section,
             drag_coefficients,
             lift_coefficients,
             time_steps,
