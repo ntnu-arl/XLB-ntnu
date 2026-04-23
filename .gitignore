@@ -23,8 +23,8 @@
 .vagrant/
 
 # Meshes
-*.obj
-*.stl
+#*.obj
+#*.stl
 *.ply
 *.off
 
