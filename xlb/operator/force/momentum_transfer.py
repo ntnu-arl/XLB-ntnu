@@ -73,12 +73,16 @@ class MomentumTransfer(Operator):
         # Give the input post-collision populations, streaming once and apply the BC the find post-stream values.
         f_post_collision = f_0
         f_post_stream = self.stream(f_post_collision)
-        f_post_stream = self.no_slip_bc_instance(f_post_collision, f_post_stream, bc_mask, missing_mask)
+        f_post_stream = self.no_slip_bc_instance(
+            f_post_collision, f_post_stream, bc_mask, missing_mask
+        )
 
         # Compute momentum transfer
         boundary = bc_mask == self.no_slip_bc_instance.id
         new_shape = (self.velocity_set.q,) + boundary.shape[1:]
-        boundary = lax.broadcast_in_dim(boundary, new_shape, tuple(range(self.velocity_set.d + 1)))
+        boundary = lax.broadcast_in_dim(
+            boundary, new_shape, tuple(range(self.velocity_set.d + 1))
+        )
 
         # the following will return force as a grid-based field with zero everywhere except for boundary nodes.
         is_edge = jnp.logical_and(boundary, ~missing_mask[0])
@@ -95,13 +99,21 @@ class MomentumTransfer(Operator):
         _opp_indices = self.velocity_set.opp_indices
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
-        _missing_mask_vec = wp.vec(self.velocity_set.q, dtype=wp.uint8)  # TODO fix vec bool
+        _missing_mask_vec = wp.vec(
+            self.velocity_set.q, dtype=wp.uint8
+        )  # TODO fix vec bool
         _no_slip_id = self.no_slip_bc_instance.id
 
         # Find velocity index for 0, 0, 0
-        for l in range(self.velocity_set.q):
-            if _c[0, l] == 0 and _c[1, l] == 0 and _c[2, l] == 0:
-                zero_index = l
+
+        if self.velocity_set.d == 2:
+            for l in range(self.velocity_set.q):
+                if _c[0, l] == 0 and _c[1, l] == 0:
+                    zero_index = l
+        elif self.velocity_set.d == 3:
+            for l in range(self.velocity_set.q):
+                if _c[0, l] == 0 and _c[1, l] == 0 and _c[2, l] == 0:
+                    zero_index = l
         _zero_index = wp.int32(zero_index)
 
         # Construct the warp kernel
@@ -144,7 +156,15 @@ class MomentumTransfer(Operator):
                 # Apply streaming (pull method)
                 timestep = 0
                 f_post_stream = self.stream.warp_functional(f_0, index)
-                f_post_stream = self.no_slip_bc_instance.warp_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream)
+                f_post_stream = self.no_slip_bc_instance.warp_functional(
+                    index,
+                    timestep,
+                    _missing_mask,
+                    f_0,
+                    f_1,
+                    f_post_collision,
+                    f_post_stream,
+                )
 
                 # Compute the momentum transfer
                 for d in range(self.velocity_set.d):
