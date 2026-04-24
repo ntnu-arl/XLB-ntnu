@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pylab as plt
 from matplotlib import cm
-from time import time
+from time import time, sleep
 import pyvista as pv
 from jax.image import resize
 from jax import jit
@@ -40,7 +40,9 @@ def downsample_field(field, factor, method="bicubic"):
     else:
         new_shape = tuple(dim // factor for dim in field.shape[:-1])
         downsampled_components = []
-        for i in range(field.shape[-1]):  # Iterate over the last dimension (vector components)
+        for i in range(
+            field.shape[-1]
+        ):  # Iterate over the last dimension (vector components)
             resized = resize(field[..., i], new_shape, method=method)
             downsampled_components.append(resized)
 
@@ -89,6 +91,7 @@ def save_image(fld, timestep=None, prefix=None, **kwargs):
     kwargs.pop("cmap", None)
     plt.imsave(fname + ".png", fld.T, cmap=cm.nipy_spectral, origin="lower", **kwargs)
 
+
 def show_image(fld, timestep=None, prefix=None, **kwargs):
     """
     Save an image of a field at a given timestep.
@@ -128,8 +131,10 @@ def show_image(fld, timestep=None, prefix=None, **kwargs):
         fld = np.sqrt(fld[0, ...] ** 2 + fld[0, ...] ** 2)
 
     plt.clf()
+    kwargs.pop("cmap", None)
     plt.imshow(fld.T, cmap=cm.nipy_spectral, origin="lower", **kwargs)
-    plt.show(block=False)
+    plt.draw()
+    plt.pause(0.001)
 
 
 def save_fields_vtk(fields, timestep, output_dir=".", prefix="fields"):
@@ -164,7 +169,9 @@ def save_fields_vtk(fields, timestep, output_dir=".", prefix="fields"):
         if key == list(fields.keys())[0]:
             dimensions = value.shape
         else:
-            assert value.shape == dimensions, "All fields must have the same dimensions!"
+            assert (
+                value.shape == dimensions
+            ), "All fields must have the same dimensions!"
 
     output_filename = os.path.join(output_dir, prefix + "_" + f"{timestep:07d}.vtk")
 
@@ -275,11 +282,15 @@ def rotate_geometry(indices, origin, axis, angle):
     This function rotates the mesh by applying a rotation matrix to the voxel indices. The rotation matrix is calculated
     using the axis-angle representation of rotations. The origin of the rotation axis is assumed to be at (0, 0, 0).
     """
-    indices_rotated = (jnp.array(indices).T - origin) @ axangle2mat(axis, angle) + origin
+    indices_rotated = (jnp.array(indices).T - origin) @ axangle2mat(
+        axis, angle
+    ) + origin
     return tuple(jnp.rint(indices_rotated).astype("int32").T)
 
 
-def voxelize_stl(stl_filename, length_lbm_unit=None, tranformation_matrix=None, pitch=None):
+def voxelize_stl(
+    stl_filename, length_lbm_unit=None, tranformation_matrix=None, pitch=None
+):
     """
     Converts an STL file to a voxelized mesh.
 
@@ -354,11 +365,13 @@ def axangle2mat(axis, angle, is_normalized=False):
     xyC = x * yC
     yzC = y * zC
     zxC = z * xC
-    return jnp.array([
-        [x * xC + c, xyC - zs, zxC + ys],
-        [xyC + zs, y * yC + c, yzC - xs],
-        [zxC - ys, yzC + xs, z * zC + c],
-    ])
+    return jnp.array(
+        [
+            [x * xC + c, xyC - zs, zxC + ys],
+            [xyC + zs, y * yC + c, yzC - xs],
+            [zxC - ys, yzC + xs, z * zC + c],
+        ]
+    )
 
 
 @wp.kernel
@@ -411,7 +424,9 @@ def get_color(
     out_color[tid] = wp.vec3(r, g, b)
 
 
-def colorize_scalars(scalars, device=None, value_range=None, percentiles=(5, 95), target=None):
+def colorize_scalars(
+    scalars, device=None, value_range=None, percentiles=(5, 95), target=None
+):
     """
     Colorize scalars using a rainbow color map.
 
@@ -437,7 +452,11 @@ def colorize_scalars(scalars, device=None, value_range=None, percentiles=(5, 95)
     """
     if device is None:
         device = scalars.device
-    colors = target if target is not None else wp.empty(scalars.shape[0], dtype=wp.vec3, device=device)
+    colors = (
+        target
+        if target is not None
+        else wp.empty(scalars.shape[0], dtype=wp.vec3, device=device)
+    )
     if value_range is None:
         scalars_np = scalars.numpy()
         low = float(np.percentile(scalars_np, percentiles[0]))
@@ -614,23 +633,42 @@ def save_usd_vorticity(
     f_current_dev = _clone_to_device(f_current, device)
     bc_mask_dev = _clone_to_device(bc_mask, device)
     with wp.ScopedDevice(device):
-        velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=ComputeBackend.WARP)
-        macro_wp = Macroscopic(compute_backend=ComputeBackend.WARP, precision_policy=precision_policy, velocity_set=velocity_set)
+        velocity_set = xlb.velocity_set.D3Q27(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
+        macro_wp = Macroscopic(
+            compute_backend=ComputeBackend.WARP,
+            precision_policy=precision_policy,
+            velocity_set=velocity_set,
+        )
         rho = wp.zeros((1, *grid_shape), dtype=wp.float32, device=device)
         u = wp.zeros((3, *grid_shape), dtype=wp.float32, device=device)
         rho, u = macro_wp(f_current_dev, rho, u)
         u = _slice_velocity_field(u, clip_lower, clip_upper)
         vorticity = wp.zeros((3, *u.shape[1:]), dtype=wp.float32, device=device)
-        vorticity_magnitude = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
-        vorticity, vorticity_magnitude = vorticity_operator(u, bc_mask_dev, vorticity, vorticity_magnitude)
+        vorticity_magnitude = wp.zeros(
+            (1, *u.shape[1:]), dtype=wp.float32, device=device
+        )
+        vorticity, vorticity_magnitude = vorticity_operator(
+            u, bc_mask_dev, vorticity, vorticity_magnitude
+        )
         max_verts = grid_shape[0] * grid_shape[1] * grid_shape[2] * 5
         max_tris = grid_shape[0] * grid_shape[1] * grid_shape[2] * 3
-        mc = wp.MarchingCubes(nx=u.shape[1], ny=u.shape[2], nz=u.shape[3], max_verts=max_verts, max_tris=max_tris, device=device)
+        mc = wp.MarchingCubes(
+            nx=u.shape[1],
+            ny=u.shape[2],
+            nz=u.shape[3],
+            max_verts=max_verts,
+            max_tris=max_tris,
+            device=device,
+        )
         mc.surface(vorticity_magnitude[0], vorticity_threshold)
         if mc.verts.shape[0] == 0:
             print(f"Warning: No vertices found for vorticity at timestep {timestep}.")
             return
-        grid_to_point_op = GridToPoint(precision_policy=precision_policy, compute_backend=ComputeBackend.WARP)
+        grid_to_point_op = GridToPoint(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
         scalars = wp.zeros(mc.verts.shape[0], dtype=wp.float32, device=device)
         scalars = grid_to_point_op(vorticity_magnitude, mc.verts, scalars)
         colors, value_range = colorize_scalars(
@@ -725,8 +763,14 @@ def save_usd_q_criterion(
     f_current_dev = _clone_to_device(f_current, device)
     bc_mask_dev = _clone_to_device(bc_mask, device)
     with wp.ScopedDevice(device):
-        velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=ComputeBackend.WARP)
-        macro_wp = Macroscopic(compute_backend=ComputeBackend.WARP, precision_policy=precision_policy, velocity_set=velocity_set)
+        velocity_set = xlb.velocity_set.D3Q27(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
+        macro_wp = Macroscopic(
+            compute_backend=ComputeBackend.WARP,
+            precision_policy=precision_policy,
+            velocity_set=velocity_set,
+        )
         rho = wp.zeros((1, *grid_shape), dtype=wp.float32, device=device)
         u = wp.zeros((3, *grid_shape), dtype=wp.float32, device=device)
         rho, u = macro_wp(f_current_dev, rho, u)
@@ -736,16 +780,27 @@ def save_usd_q_criterion(
         norm_mu, q_field = q_criterion_operator(u, bc_mask_dev, norm_mu, q_field)
         max_verts = grid_shape[0] * grid_shape[1] * grid_shape[2] * 5
         max_tris = grid_shape[0] * grid_shape[1] * grid_shape[2] * 3
-        mc = wp.MarchingCubes(nx=u.shape[1], ny=u.shape[2], nz=u.shape[3], max_verts=max_verts, max_tris=max_tris, device=device)
+        mc = wp.MarchingCubes(
+            nx=u.shape[1],
+            ny=u.shape[2],
+            nz=u.shape[3],
+            max_verts=max_verts,
+            max_tris=max_tris,
+            device=device,
+        )
         mc.surface(q_field[0], q_threshold)
         if mc.verts.shape[0] == 0:
             print(f"Warning: No vertices found for Q-criterion at timestep {timestep}.")
             return
-        grid_to_point_op = GridToPoint(precision_policy=precision_policy, compute_backend=ComputeBackend.WARP)
+        grid_to_point_op = GridToPoint(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
         scalars = wp.zeros(mc.verts.shape[0], dtype=wp.float32, device=device)
         scalars = grid_to_point_op(norm_mu, mc.verts, scalars)
         if color_range is None:
-            percentiles = color_percentiles if color_percentiles is not None else (5, 95)
+            percentiles = (
+                color_percentiles if color_percentiles is not None else (5, 95)
+            )
             colors, used_range = colorize_scalars(
                 scalars,
                 device=device,
@@ -756,7 +811,9 @@ def save_usd_q_criterion(
                 scalars,
                 device=device,
                 value_range=color_range,
-                percentiles=color_percentiles if color_percentiles is not None else (5, 95),
+                percentiles=(
+                    color_percentiles if color_percentiles is not None else (5, 95)
+                ),
             )
         vertices = mc.verts.numpy()
         indices = mc.indices.numpy()
@@ -834,15 +891,23 @@ def update_usd_lagrangian_parts(
         part_vertices = vertices_np[start:end]
         tri_count = len(faces)
         usd_mesh.GetPointsAttr().Set(part_vertices.tolist(), time=time_code)
-        usd_mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray([3] * tri_count), time=time_code)
-        usd_mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray(faces.flatten().tolist()), time=time_code)
+        usd_mesh.GetFaceVertexCountsAttr().Set(
+            Vt.IntArray([3] * tri_count), time=time_code
+        )
+        usd_mesh.GetFaceVertexIndicesAttr().Set(
+            Vt.IntArray(faces.flatten().tolist()), time=time_code
+        )
         if lag_forces_np is not None and part.get("colorize", False):
             component = int(part.get("force_component", force_component))
             forces_np = lag_forces_np[start:end, component]
             context = wp.ScopedDevice(device) if device is not None else nullcontext()
             with context:
-                force_wp = wp.from_numpy(forces_np.astype(np.float32), dtype=wp.float32, device=device)
-                colors_wp = wp.zeros(part_vertices.shape[0], dtype=wp.vec3, device=device)
+                force_wp = wp.from_numpy(
+                    forces_np.astype(np.float32), dtype=wp.float32, device=device
+                )
+                colors_wp = wp.zeros(
+                    part_vertices.shape[0], dtype=wp.vec3, device=device
+                )
                 if part.get("color_percentiles") is not None:
                     colors_wp, used_range = colorize_scalars(
                         force_wp,
@@ -870,7 +935,9 @@ def update_usd_lagrangian_parts(
     print(f"Lagrangian meshes updated at timestep {timestep}")
 
 
-def plot_object_placement(vertices_wp, grid_shape, filename, title, object_label="Object"):
+def plot_object_placement(
+    vertices_wp, grid_shape, filename, title, object_label="Object"
+):
     """
     Plot the object placement.
     The object placement is plotted as a polygon in the domain. The domain is the bounding box of the vertices.
