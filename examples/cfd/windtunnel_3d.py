@@ -21,6 +21,38 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
 # -------------------------- Helper Functions --------------------------
+# Initialize Lists to Store Coefficients and Time Steps
+time_steps = []
+drag_coefficients = []
+lift_coefficients = []
+
+
+def show_setup(mesh, inlet, outlet, walls, bc_mask):
+    viz_inlet = np.array(inlet).T  # shape (N, 3)
+    viz_outlet = np.array(outlet).T
+    viz_walls = np.array(walls).T
+
+    inlet_pc = trimesh.points.PointCloud(viz_inlet, colors=[255, 0, 0, 120])  # red
+    outlet_pc = trimesh.points.PointCloud(viz_outlet, colors=[0, 255, 0, 120])  # green
+    walls_pc = trimesh.points.PointCloud(viz_walls, colors=[0, 0, 255, 120])  # blue
+
+    bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
+    bc_cells_solid = np.stack(np.where(bc_mask_np == 255), axis=1)
+    bc_points_solid = trimesh.points.PointCloud(
+        bc_cells_solid,
+        colors=[255, 255, 255, 200],
+    )
+
+    bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
+    bc_points = trimesh.points.PointCloud(
+        bc_cells,
+        colors=[0, 0, 0, 200],
+    )
+
+    scene = trimesh.Scene(
+        [mesh, inlet_pc, outlet_pc, walls_pc, bc_points_solid, bc_points]
+    )
+    scene.show()
 
 
 def plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients):
@@ -41,12 +73,18 @@ def plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients):
     labels = ["MA 10", "MA 100", "MA 1,000", "MA 10,000", "MA 100,000"]
 
     plt.figure(figsize=(12, 8))
-    plt.plot(time_steps_np, drag_coefficients_np, label="Raw Drag Coefficient", alpha=0.5)
-    plt.plot(time_steps_np, lift_coefficients_np, label="Raw Lift Coefficient", alpha=0.5)
+    plt.plot(
+        time_steps_np, drag_coefficients_np, label="Raw Drag Coefficient", alpha=0.5
+    )
+    plt.plot(
+        time_steps_np, lift_coefficients_np, label="Raw Lift Coefficient", alpha=0.5
+    )
 
     for window, label in zip(windows, labels):
         if len(drag_coefficients_np) >= window:
-            ma = np.convolve(drag_coefficients_np, np.ones(window) / window, mode="valid")
+            ma = np.convolve(
+                drag_coefficients_np, np.ones(window) / window, mode="valid"
+            )
             plt.plot(time_steps_np[window - 1 :], ma, label=label)
 
     plt.ylim(-2.0, 2.0)
@@ -101,7 +139,9 @@ def post_process(
 
     # Remove boundary cells
     u = u[:, 1:-1, 1:-1, 1:-1]
-    u_magnitude = jnp.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2)/voxel_size  # Convert back to physical units (m/s)
+    u_magnitude = (
+        jnp.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2) / voxel_size
+    )  # Convert back to physical units (m/s)
 
     fields = {"u_magnitude": u_magnitude}
     fields["rho"] = rho
@@ -111,7 +151,10 @@ def post_process(
 
     # Save the u_magnitude slice at the mid y-plane
     mid_y = grid_shape[1] // 2
-    show_image(fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel")
+    mid_x = grid_shape[0] // 2
+    show_image(
+        fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel"
+    )
     # save_image(fields["u_magnitude"][:, mid_y, :], timestep=step, prefix="out/windtunnel")
 
     # Compute lift and drag
@@ -127,42 +170,52 @@ def post_process(
     # Plot drag coefficient
     plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients)
 
+
 # -------------------------- Simulation Setup --------------------------
 
 # Grid parameters
-grid_size_x, grid_size_y, grid_size_z = 128*2, 128*1, 128*1 # Adjust as needed for your mesh and computational resources
-grid_shape = (grid_size_x, grid_size_y, grid_size_z) 
+grid_size_x, grid_size_y, grid_size_z = (
+    64 * 5,
+    64 * 3,
+    64 * 3,
+)  # Adjust as needed for your mesh and computational resources
+grid_shape = (grid_size_x, grid_size_y, grid_size_z)
 
 # Simulation Configuration
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
-velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
-voxel_size = 0.006 # m
-wind_speed = 5.0  # Prescribed velocity at the inlet (in m/s)
-stl_filename = "./data/Sparrow.stl"    
+velocity_set = xlb.velocity_set.D3Q27(
+    precision_policy=precision_policy, compute_backend=compute_backend
+)
+voxel_size = 0.004  # m
+wind_speed = 12.0  # Prescribed velocity at the inlet (in m/s)
+stl_filename = "./data/Sparrow.stl"
 
 num_steps = 100000
 print_interval = 1000
-post_process_interval = 10
+post_process_interval = 1
 
 # Physical Parameters
 Re = 80000.0
-clength = (grid_size_x-1) * voxel_size  # Characteristic length (in physical units, e.g., m)
-visc = wind_speed * clength / Re
+clength = grid_size_x - 2
+visc = wind_speed * clength * voxel_size**2 / Re
 omega = 1.0 / (3.0 * visc + 0.5)
 
 # Print simulation info
 print("\n" + "=" * 50 + "\n")
 print("Simulation Configuration:")
 print(f"Grid size: {grid_size_x} x {grid_size_y} x {grid_size_z}")
-print(f"Grid dimensions: {grid_size_x*voxel_size} x {grid_size_y*voxel_size} x {grid_size_z*voxel_size}")
+print(
+    f"Grid dimensions: {grid_size_x*voxel_size} x {grid_size_y*voxel_size} x {grid_size_z*voxel_size}"
+)
 print(f"Number of cells: {grid_size_x*grid_size_y*grid_size_z}")
 print(f"Backend: {compute_backend}")
 print(f"Velocity set: {velocity_set}")
 print(f"Precision policy: {precision_policy}")
 print(f"Prescribed velocity: {wind_speed}")
 print(f"Reynolds number: {Re}")
+print(f"Relaxation factor: {omega}")
 print(f"Max iterations: {num_steps}")
 print("\n" + "=" * 50 + "\n")
 
@@ -181,48 +234,50 @@ box = grid.bounding_box_indices()
 box_no_edge = grid.bounding_box_indices(remove_edges=True)
 inlet = box_no_edge["left"]
 outlet = box_no_edge["right"]
-walls = [box["bottom"][i] + box["top"][i] + box["front"][i] + box["back"][i] for i in range(velocity_set.d)]
+walls = [
+    box["bottom"][i] + box["top"][i] + box["front"][i] + box["back"][i]
+    for i in range(velocity_set.d)
+]
 walls = np.unique(np.array(walls), axis=-1).tolist()
 
 # Load the mesh (replace with your own mesh)
 mesh = trimesh.load_mesh(stl_filename, process=False)
-mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1]))  # Rotate to align with flow direction
-mesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(10), [0, 1, 0]))  # Rotate to align with flow direction
+mesh.apply_transform(
+    trimesh.transformations.rotation_matrix(np.radians(90), [0, 0, 1])
+)  # Rotate to align with flow direction
+mesh.apply_transform(
+    trimesh.transformations.rotation_matrix(np.radians(10), [0, 1, 0])
+)  # Rotate to align with flow direction
 mesh_vertices = mesh.vertices
 mesh_indices = mesh.faces
 
 # Transform the mesh points to align with the grid
 mesh_vertices -= mesh_vertices.min(axis=0)
-mesh_extents = mesh_vertices.max(axis=0) # mm
+mesh_extents = mesh_vertices.max(axis=0)  # mm
 
 length_phys_unit = mesh_extents.max()
-scale = 1000*voxel_size
-mesh_vertices = mesh_vertices  / scale  # Now in physical units (e.g., m)
-shift = np.array([grid_shape[0] / 4, (grid_shape[1] - mesh_extents[1] / scale) / 2, (grid_shape[2]- mesh_extents[2] / scale) / 2])
+scale = 1000 * voxel_size
+mesh_vertices = mesh_vertices / scale  # Now in physical units (e.g., m)
+shift = np.array(
+    [
+        grid_shape[0] / 4,
+        (grid_shape[1] - mesh_extents[1] / scale) / 2,
+        (grid_shape[2] - mesh_extents[2] / scale) / 2,
+    ]
+)
 mesh_vertices += shift
 mesh_cross_section = np.prod(mesh_extents[1:]) / scale**2
 
 print(f"Mesh extents (in physical units): {mesh_extents}")
 print(f"Mesh cross-section (in lattice units): {mesh_cross_section}")
 
-# convert face indices to Nx3 coordinate arrays
-viz_inlet = np.vstack(box_no_edge["left"]).T   # shape (N, 3)
-viz_outlet = np.vstack(box_no_edge["right"]).T
-viz_walls = np.vstack([
-    np.vstack(box["bottom"]).T,
-    np.vstack(box["top"]).T,
-    np.vstack(box["front"]).T,
-    np.vstack(box["back"]).T,
-])
-
-inlet_pc = trimesh.points.PointCloud(viz_inlet, colors=[255, 0, 0, 120])    # red
-outlet_pc = trimesh.points.PointCloud(viz_outlet, colors=[0, 255, 0, 120])  # green
-walls_pc = trimesh.points.PointCloud(viz_walls, colors=[0, 0, 255, 120])    # blue
 
 mesh.vertices = mesh_vertices
 
-bc_left = RegularizedBC("velocity", prescribed_value=(wind_speed*voxel_size, 0.0, 0.0), indices=inlet)
-bc_walls = ExtrapolationOutflowBC(indices=walls) #FullwayBounceBackBC(indices=walls)
+bc_left = RegularizedBC(
+    "velocity", prescribed_value=(wind_speed * voxel_size, 0.0, 0.0), indices=inlet
+)
+bc_walls = FullwayBounceBackBC(indices=walls)
 bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
 bc_mesh = HalfwayBounceBackBC(mesh_vertices=mesh_vertices)
 boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_mesh]
@@ -237,24 +292,7 @@ stepper = IncompressibleNavierStokesStepper(
 # Prepare Fields
 f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
 
-# Convert to numpy if needed
-bc_mask_np = bc_mask.numpy()[0] if isinstance(bc_mask, wp.array) else bc_mask
-bc_cells_solid = np.stack(np.where(bc_mask_np == 255), axis=1)
-bc_points_solid = trimesh.points.PointCloud(
-    bc_cells_solid,
-    colors=[255, 255, 255, 200],
-)
-
-bc_cells = np.stack(np.where(bc_mask_np == bc_mesh.id), axis=1)
-bc_points = trimesh.points.PointCloud(
-    bc_cells,
-    colors=[0, 0, 0, 200],
-)
-
-print(f"Number of solid boundary cells on the mesh: {len(bc_cells_solid)}")
-print(f"Number of boundary cells on the mesh: {len(bc_cells)}")
-scene = trimesh.Scene([mesh, inlet_pc, outlet_pc, walls_pc, bc_points_solid, bc_points])
-scene.show()
+show_setup(mesh, inlet, outlet, walls, bc_mask)
 
 # Setup Momentum Transfer for Force Calculation
 bc_mesh = boundary_conditions[-1]
@@ -264,13 +302,10 @@ momentum_transfer = MomentumTransfer(bc_mesh, compute_backend=compute_backend)
 macro = Macroscopic(
     compute_backend=ComputeBackend.JAX,
     precision_policy=precision_policy,
-    velocity_set=xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=ComputeBackend.JAX),
+    velocity_set=xlb.velocity_set.D3Q27(
+        precision_policy=precision_policy, compute_backend=ComputeBackend.JAX
+    ),
 )
-
-# Initialize Lists to Store Coefficients and Time Steps
-time_steps = []
-drag_coefficients = []
-lift_coefficients = []
 
 # -------------------------- Simulation Loop --------------------------
 
