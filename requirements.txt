@@ -1,6 +1,8 @@
-jax[cuda]
 matplotlib
+jax[cuda]
 numpy
+pyqtgraph
+PySide6
 pyvista
 Rtree
 trimesh

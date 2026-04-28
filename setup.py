@@ -13,6 +13,8 @@ setup(
     install_requires=[
         "matplotlib>=3.9.2",
         "numpy>=2.1.2",
+        "pyqtgraph>=0.13.7",
+        "PySide6>=6.7.0",
         "pyvista>=0.44.1",
         "trimesh>=4.4.9",
         "warp-lang>=1.10.0",

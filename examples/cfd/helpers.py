@@ -1,21 +1,25 @@
-from xlb.utils import save_image, save_fields_vtk, show_image
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from matplotlib.patches import Patch
-from matplotlib.path import Path as MplPath
+import importlib
 import numpy as np
 import jax.numpy as jnp
 import warp as wp
+
+pg: Any = None
+try:
+    pg = importlib.import_module("pyqtgraph")
+except Exception:  # pragma: no cover - optional dependency.
+    pass
+
+from matplotlib.path import Path as MplPath
 
 @dataclass
 class LBUnitConverter:
     """Convert between SI units and lattice units for a D2Q9 simulation."""
 
     grid_shape: tuple
-    domain_size_m: tuple
+    domain_length_m: float
     chord_fraction: float
     wind_speed_mps: Optional[float] = None
     reynolds_number: Optional[float] = None
@@ -25,12 +29,9 @@ class LBUnitConverter:
 
     def __post_init__(self):
         nx, ny = self.grid_shape
-        lx_m, ly_m = self.domain_size_m
+        lx_m = self.domain_length_m
 
         self.dx = lx_m / nx
-        self.dy = ly_m / ny
-        if not np.isclose(self.dx, self.dy):
-            raise ValueError("Non-square cells detected. Please use isotropic spacing.")
 
         self.chord_m = self.chord_fraction * lx_m
 
@@ -265,147 +266,297 @@ def build_airfoil_indices(
     )
 
 
-
-def plot_simulation_setup(
-    grid_shape,
-    voxel_size,
-    bc_mask,
-    wall_id,
-    inlet_id,
-    outlet_id,
-    obstacle_id,
-    boundary_linewidth=10,
-):
-    cmap = ListedColormap(
-        [
-            "#f2f2f2",  # fluid
-            "#2b6cb0",  # walls
-            "#38a169",  # inlet
-            "#dd6b20",  # outlet
-            "#c53030",  # obstacle
-        ]
-    )
-    if isinstance(bc_mask, jnp.ndarray):
-        bc_mask_np = np.array(bc_mask)
-    else:
-        bc_mask_np = np.array(wp.to_jax(bc_mask))
-
-    # bc_mask is [1, nx, ny, nz] in this setup; use the first component/layer.
-    mask_2d = bc_mask_np[0, :, :, 0]
-
-    # Convert BC ids to compact plotting classes:
-    # 0=fluid, 1=wall, 2=inlet, 3=outlet, 4=obstacle
-    plot_mask = np.zeros_like(mask_2d, dtype=np.uint8)
-    plot_mask[mask_2d == wall_id] = 1
-    plot_mask[mask_2d == inlet_id] = 2
-    plot_mask[mask_2d == outlet_id] = 3
-    plot_mask[mask_2d == obstacle_id] = 4
-
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-    extent = (0.0, grid_shape[0] * voxel_size, 0.0, grid_shape[1] * voxel_size)
-    ax.imshow(
-        plot_mask.T,
-        origin="lower",
-        cmap=cmap,
-        interpolation="nearest",
-        extent=extent,
-        aspect="equal",
-    )
-
-    # Add thick outlines so boundary-condition regions are easier to see.
-    boundary_layers = [
-        (1, "#2b6cb0"),  # wall
-        (2, "#38a169"),  # inlet
-        (3, "#dd6b20"),  # outlet
-    ]
-    for boundary_class, color in boundary_layers:
-        boundary_binary = (plot_mask == boundary_class).astype(np.float32)
-        if np.any(boundary_binary):
-            ax.contour(
-                boundary_binary.T,
-                levels=[0.5],
-                colors=[color],
-                linewidths=boundary_linewidth,
-                origin="lower",
-                extent=extent,
-            )
-
-    ax.set_title("2D Wind Tunnel Setup")
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_xlim(0, grid_shape[0] * voxel_size)
-    ax.set_ylim(0, grid_shape[1] * voxel_size)
-
-    legend_handles = [
-        Patch(facecolor="#f2f2f2", edgecolor="none", label="Fluid"),
-        Patch(facecolor="#2b6cb0", edgecolor="none", label="Wall"),
-        Patch(facecolor="#38a169", edgecolor="none", label="Inlet"),
-        Patch(facecolor="#dd6b20", edgecolor="none", label="Outlet"),
-        Patch(facecolor="#c53030", edgecolor="none", label="Obstacle"),
-    ]
-    ax.legend(handles=legend_handles, loc="lower right", frameon=True)
-
-    ax.annotate(
-        "",
-        xy=(0.92, 0.95),
-        xytext=(0.08, 0.95),
-        xycoords="axes fraction",
-        arrowprops=dict(arrowstyle="->", lw=2.0, color="black"),
-    )
-    ax.text(
-        0.50,
-        0.98,
-        "Flow direction",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=10,
-    )
-
-    fig.tight_layout()
-    plt.show(block=True)
-    plt.close(fig)
+_WINDTUNNEL_DASHBOARD = None
 
 
-def post_process(
-    step,
-    f_0,
-    macro,
-    units,
-    field_prefix="out/windtunnel2d",
-):
-    # Convert to JAX array if necessary
+def _require_pyqtgraph():
+    if pg is None:
+        raise RuntimeError(
+            "pyqtgraph is not available. Install pyqtgraph and PySide6 to use live plotting."
+        )
+
+
+def _to_numpy(array):
+    if isinstance(array, np.ndarray):
+        return array
+    if isinstance(array, jnp.ndarray):
+        return np.asarray(array)
+    try:
+        return np.asarray(wp.to_jax(array))
+    except Exception:
+        return np.asarray(array)
+
+
+def _normalize_index_pairs(indices):
+    if indices is None:
+        return np.empty((0, 2), dtype=np.float32)
+
+    array = np.asarray(indices)
+    if array.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    if array.ndim == 2 and array.shape[0] == 2:
+        return np.column_stack([array[0], array[1]]).astype(np.float32)
+
+    if array.ndim == 2 and array.shape[1] == 2:
+        return array.astype(np.float32)
+
+    raise ValueError("indices must be shaped like [2, N] or [N, 2].")
+
+
+def _normalize_boundary_layer_voxels(boundary_layer_voxels):
+    if boundary_layer_voxels is None:
+        return np.empty((0, 5), dtype=np.float32)
+
+    array = np.asarray(boundary_layer_voxels, dtype=np.float32)
+    if array.size == 0:
+        return np.empty((0, 5), dtype=np.float32)
+    if array.ndim != 2 or array.shape[1] < 5:
+        raise ValueError(
+            "boundary_layer_voxels must be shaped like [N, 5] with columns [x, y, x/c, y/c, side]."
+        )
+    return array
+
+
+def _extract_windtunnel_diagnostics(f_0, macro, units:LBUnitConverter, boundary_layer_voxels=None):
     if not isinstance(f_0, jnp.ndarray):
         f_0_jax = wp.to_jax(f_0)
     else:
         f_0_jax = f_0
 
     rho, u = macro(f_0_jax)
-
     rho = rho[:, 1:-1, 1:-1, 0]
     u = u[:, 1:-1, 1:-1, 0]
-    u_magnitude_lb = jnp.sqrt(u[0] ** 2 + u[1] ** 2)
-    u_magnitude = units.to_si_velocity(u_magnitude_lb)
-    q_dynamic = 0.5 * units.rho_ref_kgm3 * u_magnitude**2
-    p_fluctuation = units.pressure_fluctuation_to_si(rho[0])
 
-    fields = {
-        "rho": rho[0],
-        "u_x": u[0],
-        "u_y": u[1],
-        "u_magnitude": u_magnitude,
-        "q_dynamic": q_dynamic,
-        "p_fluctuation": p_fluctuation,
+    flowfield = _to_numpy(units.to_si_velocity(jnp.sqrt(u[0] ** 2 + u[1] ** 2)))
+    #flowfield = _to_numpy(units.to_si_velocity(u[1]))
+
+    q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
+    pressure = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0))
+    pressure_coefficient = np.asarray(pressure / q_inf)
+
+    if boundary_layer_voxels is None:
+        return flowfield, None
+
+    boundary_layer_voxels = _normalize_boundary_layer_voxels(boundary_layer_voxels)
+    if boundary_layer_voxels.size == 0:
+        return flowfield, None
+
+    sample_x = boundary_layer_voxels[:, 0].astype(np.int32)
+    sample_y = boundary_layer_voxels[:, 1].astype(np.int32)
+    chord_fraction = boundary_layer_voxels[:, 2].astype(np.float32)
+    side_flag = boundary_layer_voxels[:, 4].astype(np.float32)
+    sample_values = pressure_coefficient[sample_x, sample_y]
+
+    upper_mask = side_flag > 0.0
+    lower_mask = side_flag < 0.0
+    if not np.any(upper_mask) or not np.any(lower_mask):
+        return flowfield, None
+
+    upper_x = chord_fraction[upper_mask]
+    upper_cp = sample_values[upper_mask]
+    lower_x = chord_fraction[lower_mask]
+    lower_cp = sample_values[lower_mask]
+
+    upper_order = np.argsort(upper_x)
+    lower_order = np.argsort(lower_x)
+    pressure_profile = {
+        "upper_x": upper_x[upper_order],
+        "upper_cp": upper_cp[upper_order],
+        "lower_x": lower_x[lower_order],
+        "lower_cp": lower_cp[lower_order],
     }
-    # save_fields_vtk(fields, timestep=step, prefix=field_prefix)
-    # save_image(fields["u_magnitude"], timestep=step, prefix=field_prefix)
-    show_image(
-        fields["u_magnitude"],
-        timestep=step,
-        prefix=field_prefix,
-        vmin=0,
-        vmax=units.wind_speed_mps*1.5,
+    return flowfield, pressure_profile
+
+
+class WindTunnelDashboard:
+    def __init__(self, flowfield_shape, voxel_size, flow_vmax=None):
+        _require_pyqtgraph()
+        self.app = pg.mkQApp("XLB Wind Tunnel Dashboard")
+        self.window = pg.GraphicsLayoutWidget(title="XLB Wind Tunnel Dashboard")
+        self.window.resize(1600, 700)
+        self.flowfield_shape = tuple(flowfield_shape)
+        self.voxel_size = voxel_size
+        self.flow_vmax = flow_vmax
+
+        self.flow_plot = self.window.addPlot(row=0, col=0)
+        self.flow_plot.setAspectLocked(True)
+        self.flow_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.flow_plot.setLabel("bottom", "x", units="m")
+        self.flow_plot.setLabel("left", "y", units="m")
+        self.flow_plot.setTitle("Flowfield magnitude")
+
+        self.flow_image = pg.ImageItem(axisOrder="row-major")
+        self.flow_image.setLookupTable(
+            pg.colormap.get("viridis").getLookupTable(0.0, 1.0, 256)
+        )
+        self.flow_plot.addItem(self.flow_image)
+
+        self.airfoil_overlay = pg.ScatterPlotItem(
+            pen=pg.mkPen("#111111", width=1),
+            brush=pg.mkBrush(17, 17, 17, 160),
+            size=3,
+        )
+        self.flow_plot.addItem(self.airfoil_overlay)
+
+        # BC contour overlays for walls, inlet, outlet, obstacle
+        self.wall_contour = pg.PlotCurveItem(pen=pg.mkPen("#2b6cb0", width=2))
+        self.inlet_contour = pg.PlotCurveItem(pen=pg.mkPen("#38a169", width=2))
+        self.outlet_contour = pg.PlotCurveItem(pen=pg.mkPen("#dd6b20", width=2))
+        self.obstacle_contour = pg.PlotCurveItem(pen=pg.mkPen("#c53030", width=2))
+        self.flow_plot.addItem(self.wall_contour)
+        self.flow_plot.addItem(self.inlet_contour)
+        self.flow_plot.addItem(self.outlet_contour)
+        self.flow_plot.addItem(self.obstacle_contour)
+
+        self.pressure_plot = self.window.addPlot(row=0, col=1)
+        self.pressure_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.pressure_plot.setLabel("bottom", "Chord fraction", units="x/c")
+        self.pressure_plot.setLabel("left", "Pressure coefficient", units="C_p")
+        self.pressure_plot.invertY(True)
+        self.pressure_plot.addLegend()
+        self.upper_curve = self.pressure_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#2b6cb0", width=2),
+            symbol="o",
+            symbolSize=5,
+            name="Upper surface",
+        )
+        self.lower_curve = self.pressure_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#c53030", width=2),
+            symbol="o",
+            symbolSize=5,
+            name="Lower surface",
+        )
+        self.boundary_overlay = self.pressure_plot.plot(
+            [],
+            [],
+            pen=None,
+            symbol="o",
+            symbolSize=4,
+            symbolBrush=pg.mkBrush(120, 120, 120, 120),
+            name="Boundary samples",
+        )
+
+        self.window.show()
+        self.app.processEvents()
+
+    def update(
+        self,
+        step,
+        flowfield,
+        pressure_profile=None,
+        boundary_layer_voxels=None,
+        airfoil_angle_deg=None,
+
+    ):
+        flowfield_np = _to_numpy(flowfield)
+        if flowfield_np.ndim != 2:
+            raise ValueError("flowfield must be a 2D array of velocity magnitudes.")
+
+        self.flow_image.setImage(flowfield_np.T, autoLevels=False)
+        vmax = self.flow_vmax if self.flow_vmax is not None else float(np.nanmax(flowfield_np))
+        self.flow_image.setLevels((0.0, max(vmax, 1.0e-3)))
+        self.flow_plot.setXRange(0.0, flowfield_np.shape[0], padding=0.0)
+        self.flow_plot.setYRange(0.0, flowfield_np.shape[1], padding=0.0)
+        self.flow_plot.setTitle(f"Flowfield magnitude (step {step})")
+
+        upper_x, upper_cp, lower_x, lower_cp, boundary_x, boundary_y = self._pressure_arrays(
+            pressure_profile,
+            boundary_layer_voxels,
+        )
+        self.upper_curve.setData(upper_x, upper_cp)
+        self.lower_curve.setData(lower_x, lower_cp)
+        self.boundary_overlay.setData(boundary_x, boundary_y)
+        self.pressure_plot.setTitle(self._pressure_title(step, airfoil_angle_deg))
+        self._update_pressure_range(upper_cp, lower_cp)
+        self.app.processEvents()
+
+    @staticmethod
+    def _pressure_arrays(pressure_profile, boundary_layer_voxels):
+        if pressure_profile is None:
+            empty = np.asarray([], dtype=np.float32)
+            boundary_empty = np.asarray([], dtype=np.float32)
+            return empty, empty, empty, empty, boundary_empty, boundary_empty
+
+        boundary_layer_voxels = _normalize_boundary_layer_voxels(boundary_layer_voxels)
+        return (
+            np.asarray(pressure_profile["upper_x"], dtype=np.float32),
+            np.asarray(pressure_profile["upper_cp"], dtype=np.float32),
+            np.asarray(pressure_profile["lower_x"], dtype=np.float32),
+            np.asarray(pressure_profile["lower_cp"], dtype=np.float32),
+            boundary_layer_voxels[:, 2] if boundary_layer_voxels.size else np.asarray([], dtype=np.float32),
+            boundary_layer_voxels[:, 3] if boundary_layer_voxels.size else np.asarray([], dtype=np.float32),
+        )
+
+    @staticmethod
+    def _pressure_title(step, airfoil_angle_deg):
+        if airfoil_angle_deg is None:
+            return f"Airfoil pressure profile (step {step})"
+        return f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
+
+    def _update_pressure_range(self, upper_cp, lower_cp):
+        finite_values = np.concatenate(
+            [upper_cp[np.isfinite(upper_cp)], lower_cp[np.isfinite(lower_cp)]]
+        )
+        if finite_values.size == 0:
+            return
+        cp_min = float(np.min(finite_values))
+        cp_max = float(np.max(finite_values))
+        padding = max(0.05 * (cp_max - cp_min), 0.05)
+        self.pressure_plot.setYRange(cp_min - padding, cp_max + padding, padding=0.0)
+
+
+def _get_dashboard(flowfield_shape, voxel_size, flow_vmax):
+    global _WINDTUNNEL_DASHBOARD
+    if (
+        _WINDTUNNEL_DASHBOARD is None
+        or _WINDTUNNEL_DASHBOARD.flowfield_shape != tuple(flowfield_shape)
+        or _WINDTUNNEL_DASHBOARD.voxel_size != voxel_size
+    ):
+        _WINDTUNNEL_DASHBOARD = WindTunnelDashboard(
+            flowfield_shape=flowfield_shape,
+            voxel_size=voxel_size,
+            flow_vmax=flow_vmax,
+        )
+    return _WINDTUNNEL_DASHBOARD
+
+def post_process(
+    step,
+    f_0,
+    macro,
+    units,
+    obstacle_indices=None,
+    boundary_layer_voxels=None,
+    airfoil_angle_deg=None,
+):
+    flowfield, pressure_profile = _extract_windtunnel_diagnostics(
+        f_0,
+        macro,
+        units,
+        boundary_layer_voxels=boundary_layer_voxels,
     )
+
+    dashboard = _get_dashboard(
+        flowfield_shape=flowfield.shape,
+        voxel_size=units.dx,
+        flow_vmax=units.wind_speed_mps * 1.5,
+    )
+    dashboard.update(
+        step=step,
+        flowfield=flowfield,
+        pressure_profile=pressure_profile,
+        boundary_layer_voxels=boundary_layer_voxels,
+        airfoil_angle_deg=airfoil_angle_deg,
+    )
+
+    return {
+        "flowfield": flowfield,
+        "pressure_profile": pressure_profile,
+    }
 
 
 def plot_pressure_profile(
@@ -418,185 +569,73 @@ def plot_pressure_profile(
     airfoil_angle_deg: Optional[float] = None,
     field_prefix: str = "out/pressure_profile",
 ):
-    if upper_chord_fraction.size == 0 and lower_chord_fraction.size == 0:
-        return
+    _require_pyqtgraph()
+    boundary_layer_voxels = _normalize_boundary_layer_voxels(boundary_layer_voxels)
 
-    fig, (ax_profile, ax_delta) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    app = pg.mkQApp("XLB Airfoil Pressure Profile")
+    window = pg.GraphicsLayoutWidget(title="Airfoil Pressure Profile")
+    window.resize(1000, 700)
+    plot = window.addPlot()
+    plot.showGrid(x=True, y=True, alpha=0.2)
+    plot.setLabel("bottom", "Chord fraction, x/c")
+    plot.setLabel("left", "Pressure coefficient, C_p")
+    plot.invertY(True)
+
     upper_mask = np.isfinite(upper_chord_fraction) & np.isfinite(upper_pressure_coefficient)
     lower_mask = np.isfinite(lower_chord_fraction) & np.isfinite(lower_pressure_coefficient)
-    ax_profile.plot(
+
+    plot.plot(
         upper_chord_fraction[upper_mask],
         upper_pressure_coefficient[upper_mask],
-        color="#2b6cb0",
-        linewidth=1.8,
-        marker="o",
-        markersize=3,
-        alpha=0.9,
-        label="Upper surface",
+        pen=pg.mkPen("#2b6cb0", width=2),
+        symbol="o",
+        symbolSize=5,
+        name="Upper surface",
     )
-    ax_profile.plot(
+    plot.plot(
         lower_chord_fraction[lower_mask],
         lower_pressure_coefficient[lower_mask],
-        color="#c53030",
-        linewidth=1.8,
-        marker="o",
-        markersize=3,
-        alpha=0.9,
-        label="Lower surface",
+        pen=pg.mkPen("#c53030", width=2),
+        symbol="o",
+        symbolSize=5,
+        name="Lower surface",
     )
-    # Plot boundary-layer samples on a secondary y-axis for separate scaling.
-    ax_secondary = ax_profile.twinx()
-    ax_secondary.plot(
-        boundary_layer_voxels[:, 2],
-        -boundary_layer_voxels[:, 3]*1.0,  # Scale distance for visibility
-        color="gray",
-        linestyle="",
-        marker="o",
-        markersize=2,
-        alpha=0.5,
-        label="Boundary layer samples",
-    )
-    ax_secondary.set_ylabel("Boundary layer distance (scaled)")
-    ax_secondary.invert_yaxis()
-    ax_secondary.set_ylim(-0.3, 0.3)
-    ax_profile.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
-    ax_profile.invert_yaxis()
-    ax_profile.set_ylabel("Pressure coefficient $C_p$")
-    ax_profile.set_title(f"Airfoil pressure profile (step {step})")
-    ax_profile.grid(True, alpha=0.25)
-    # Combine legends from primary and secondary axes (if present).
-    handles1, labels1 = ax_profile.get_legend_handles_labels()
-    handles2, labels2 = ([], [])
-    try:
-        handles2, labels2 = ax_secondary.get_legend_handles_labels()
-    except NameError:
-        pass
-    if handles2:
-        ax_profile.legend(handles1 + handles2, labels1 + labels2, loc="best")
-    else:
-        ax_profile.legend(handles1, labels1, loc="best")
 
-    if np.count_nonzero(upper_mask) > 1 and np.count_nonzero(lower_mask) > 1:
-        xu = upper_chord_fraction[upper_mask]
-        cpu = upper_pressure_coefficient[upper_mask]
-        xl = lower_chord_fraction[lower_mask]
-        cpl = lower_pressure_coefficient[lower_mask]
-
-        upper_order = np.argsort(xu)
-        lower_order = np.argsort(xl)
-        xu = xu[upper_order]
-        cpu = cpu[upper_order]
-        xl = xl[lower_order]
-        cpl = cpl[lower_order]
-
-        xl_unique, xl_unique_idx = np.unique(xl, return_index=True)
-        cpl_unique = cpl[xl_unique_idx]
-
-        overlap_min = max(xu.min(), xl_unique.min())
-        overlap_max = min(xu.max(), xl_unique.max())
-        overlap_mask = (xu >= overlap_min) & (xu <= overlap_max)
-        if np.any(overlap_mask):
-            xu_overlap = xu[overlap_mask]
-            cpl_interp = np.interp(xu_overlap, xl_unique, cpl_unique)
-            pressure_difference = cpl_interp - cpu[overlap_mask]
-            ax_delta.plot(
-                xu_overlap,
-                pressure_difference,
-                color="#2f855a",
-                linewidth=1.8,
-                marker="o",
-                markersize=3,
-                alpha=0.9,
-            )
-
-    ax_delta.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
-    ax_delta.set_xlabel("Chord fraction, x/c")
-    ax_delta.set_ylabel(r"$\Delta C_p = C_{p,lower} - C_{p,upper}$")
-    ax_delta.grid(True, alpha=0.25)
-    if airfoil_angle_deg is not None:
-        ax_profile.set_title(
-            f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
+    if boundary_layer_voxels.size > 0:
+        plot.plot(
+            boundary_layer_voxels[:, 2],
+            -boundary_layer_voxels[:, 3],
+            pen=None,
+            symbol="o",
+            symbolSize=4,
+            symbolBrush=pg.mkBrush(120, 120, 120, 120),
+            name="Boundary samples",
         )
-    else:
-        ax_profile.set_title(f"Airfoil pressure profile (step {step})")
-    fig.tight_layout()
-    fig.savefig(f"{field_prefix}_{step:06d}.png", dpi=200)
-    plt.close(fig)
+
+    plot.addLegend()
+    plot.setTitle(
+        f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
+        if airfoil_angle_deg is not None
+        else f"Airfoil pressure profile (step {step})"
+    )
+
+    window.show()
+    app.processEvents()
 
 
 def capture_pressure_profile(
-    step,
     f_0,
     macro,
     units,
     boundary_layer_voxels,
-    airfoil_angle_deg,
-    field_prefix="out/pressure_profile",
 ):
-    if not isinstance(f_0, jnp.ndarray):
-        f_0_jax = wp.to_jax(f_0)
-    else:
-        f_0_jax = f_0
-
-    rho, _ = macro(f_0_jax)
-    rho = rho[:, 1:-1, 1:-1, 0]
-    rho_mean = rho.mean()
-    pressure = units.pressure_fluctuation_to_si(rho[0])-units.pressure_fluctuation_to_si(rho_mean)  # Subtract reference pressure to get actual pressure distribution.
-
-    q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
-    pressure_coefficient = np.asarray(pressure / q_inf)
-
-    boundary_layer_voxels = np.asarray(boundary_layer_voxels, dtype=np.float32)
-    if boundary_layer_voxels.ndim != 2 or boundary_layer_voxels.shape[1] < 5:
-        raise ValueError(
-            "boundary_layer_voxels must be shaped like [N, 5] with columns [x, y, x/c, y/c, side]."
-        )
-
-    if boundary_layer_voxels.size == 0:
-        return None
-
-    sample_x = boundary_layer_voxels[:, 0].astype(np.int32)
-    sample_y = boundary_layer_voxels[:, 1].astype(np.int32)
-    chord_fraction = boundary_layer_voxels[:, 2].astype(np.float32)
-    side_flag = boundary_layer_voxels[:, 4].astype(np.float32)
-
-    sample_values = pressure_coefficient[sample_x, sample_y]
-
-    finite_chord_mask = np.isfinite(chord_fraction)
-    if not np.any(finite_chord_mask):
-        return None
-
-    upper_mask = side_flag > 0.0
-    lower_mask = side_flag < 0.0
-
-    upper_x = chord_fraction[upper_mask]
-    upper_cp = sample_values[upper_mask]
-    lower_x = chord_fraction[lower_mask]
-    lower_cp = sample_values[lower_mask]
-
-    if upper_x.size == 0 or lower_x.size == 0:
-        return None
-
-    upper_order = np.argsort(upper_x)
-    lower_order = np.argsort(lower_x)
-
-    upper_x = upper_x[upper_order]
-    upper_cp = upper_cp[upper_order]
-    lower_x = lower_x[lower_order]
-    lower_cp = lower_cp[lower_order]
-
-    plot_pressure_profile(
-        upper_x,
-        upper_cp,
-        lower_x,
-        lower_cp,
-        boundary_layer_voxels,
-        step=step,
-        airfoil_angle_deg=airfoil_angle_deg,
-        field_prefix=field_prefix,
+    _, pressure_profile = _extract_windtunnel_diagnostics(
+        f_0,
+        macro,
+        units,
+        boundary_layer_voxels=boundary_layer_voxels,
     )
-
-    return upper_x, upper_cp, lower_x, lower_cp
+    return pressure_profile
 
 def plot_drag_coefficient(
     current_step, drag_coefficients: np.ndarray, lift_coefficients: np.ndarray
@@ -609,32 +648,27 @@ def plot_drag_coefficient(
         drag_coefficients (np.array): List of drag coefficients.
         lift_coefficients (np.array): List of lift coefficients.
     """
-    # Convert lists to numpy arrays for processing
-
     if current_step <= 0:
         return
-
+    _require_pyqtgraph()
+    app = pg.mkQApp("XLB Drag/Lift Coefficients")
+    window = pg.GraphicsLayoutWidget(title="Drag/Lift Coefficients")
+    window.resize(1000, 500)
+    plot = window.addPlot()
+    plot.showGrid(x=True, y=True, alpha=0.2)
+    plot.setLabel("bottom", "Time step")
+    plot.setLabel("left", "Coefficient")
     x = np.arange(current_step)
-
-    plt.figure(figsize=(12, 8))
-    plt.plot(x, drag_coefficients[:current_step], label="Drag Coefficient", color="red", alpha=0.3)
-    plt.hlines(drag_coefficients[:current_step].mean(), 0, current_step, colors="red", linestyles="dashed", label="Drag Coefficient Mean")
-    plt.plot(x, lift_coefficients[:current_step], label="Lift Coefficient", color="blue", alpha=0.3)
-    plt.hlines(lift_coefficients[:current_step].mean(), 0, current_step, colors="blue", linestyles="dashed", label="Lift Coefficient Mean")
-
+    plot.plot(x, drag_coefficients[:current_step], pen=pg.mkPen("#c53030", width=2), name="Drag coefficient")
+    plot.plot(x, lift_coefficients[:current_step], pen=pg.mkPen("#2b6cb0", width=2), name="Lift coefficient")
+    plot.addLegend()
+    plot.setTitle(f"Drag/Lift Coefficients (step {current_step})")
     print(
         f"Batch-averaged Drag Coefficient: {drag_coefficients[:current_step].mean():.4f}, "
         f"Lift Coefficient: {lift_coefficients[:current_step].mean():.4f}"
     )
-
-
-    plt.ylim(-2.0, 2.0)
-    plt.legend()
-    plt.xlabel("Time step")
-    plt.ylabel("Drag coefficient")
-    plt.title(f"Drag/Lift Coefficients (Batch-Averaged, step {current_step})")
-    plt.savefig("out/drag_coefficient_ma.png")
-    plt.close()
+    window.show()
+    app.processEvents()
 
 def compute_forces(step, f_0, f_1, bc_mask, missing_mask, momentum_transfer, units, airfoil_chord_length):
     boundary_force = momentum_transfer(f_0, f_1, bc_mask, missing_mask)
