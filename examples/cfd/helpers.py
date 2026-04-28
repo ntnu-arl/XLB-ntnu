@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover - optional dependency.
 
 from matplotlib.path import Path as MplPath
 
+
 @dataclass
 class LBUnitConverter:
     """Convert between SI units and lattice units for a D2Q9 simulation."""
@@ -99,6 +100,7 @@ class LBUnitConverter:
 
 # -------------------------- Helper Functions --------------------------
 
+
 def build_airfoil_indices(
     grid_shape,
     chord_fraction=0.20,
@@ -165,8 +167,6 @@ def build_airfoil_indices(
     xl = x + yt * np.sin(theta)
     yl = yc - yt * np.cos(theta)
 
-    
-
     # Closed polygon: upper surface (LE->TE), then lower (TE->LE).
     x_poly = np.concatenate([xu, xl[::-1]])
     y_poly = np.concatenate([yu, yl[::-1]])
@@ -194,7 +194,20 @@ def build_airfoil_indices(
     obstacle_mask = inside
 
     boundary_layer_mask = np.zeros_like(obstacle_mask, dtype=bool)
-    neighbor_offsets = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+    neighbor_offsets = (
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+        (2, 0),
+        (-2, 0),
+        (0, 2),
+        (0, -2),
+    )
     obstacle_cells = np.stack(np.where(obstacle_mask), axis=1)
 
     for x_idx, y_idx in obstacle_cells:
@@ -318,7 +331,9 @@ def _normalize_boundary_layer_voxels(boundary_layer_voxels):
     return array
 
 
-def _extract_windtunnel_diagnostics(f_0, macro, units:LBUnitConverter, boundary_layer_voxels=None):
+def _extract_windtunnel_diagnostics(
+    f_0, macro, units: LBUnitConverter, boundary_layer_voxels=None
+):
     if not isinstance(f_0, jnp.ndarray):
         f_0_jax = wp.to_jax(f_0)
     else:
@@ -329,7 +344,7 @@ def _extract_windtunnel_diagnostics(f_0, macro, units:LBUnitConverter, boundary_
     u = u[:, 1:-1, 1:-1, 0]
 
     flowfield = _to_numpy(units.to_si_velocity(jnp.sqrt(u[0] ** 2 + u[1] ** 2)))
-    #flowfield = _to_numpy(units.to_si_velocity(u[1]))
+    # flowfield = _to_numpy(units.to_si_velocity(u[1]))
 
     q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
     pressure = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0))
@@ -399,6 +414,9 @@ class WindTunnelDashboard:
         )
         self.flow_plot.addItem(self.airfoil_overlay)
 
+        self.upper_cp_buffer = None
+        self.lower_cp_buffer = None
+
         # BC contour overlays for walls, inlet, outlet, obstacle
         self.wall_contour = pg.PlotCurveItem(pen=pg.mkPen("#2b6cb0", width=2))
         self.inlet_contour = pg.PlotCurveItem(pen=pg.mkPen("#38a169", width=2))
@@ -451,45 +469,56 @@ class WindTunnelDashboard:
         pressure_profile=None,
         boundary_layer_voxels=None,
         airfoil_angle_deg=None,
-
     ):
         flowfield_np = _to_numpy(flowfield)
         if flowfield_np.ndim != 2:
             raise ValueError("flowfield must be a 2D array of velocity magnitudes.")
 
         self.flow_image.setImage(flowfield_np.T, autoLevels=False)
-        vmax = self.flow_vmax if self.flow_vmax is not None else float(np.nanmax(flowfield_np))
-        self.flow_image.setLevels((0.0, max(vmax, 1.0e-3)))
+        vmax = (
+            self.flow_vmax
+            if self.flow_vmax is not None
+            else float(np.amax(flowfield_np))
+        )
+        self.flow_image.setLevels((0.0, max(vmax, 1.0e-6)))
         self.flow_plot.setXRange(0.0, flowfield_np.shape[0], padding=0.0)
         self.flow_plot.setYRange(0.0, flowfield_np.shape[1], padding=0.0)
         self.flow_plot.setTitle(f"Flowfield magnitude (step {step})")
 
-        upper_x, upper_cp, lower_x, lower_cp, boundary_x, boundary_y = self._pressure_arrays(
+        upper_x, upper_cp, lower_x, lower_cp = self._pressure_arrays(
             pressure_profile,
             boundary_layer_voxels,
         )
-        self.upper_curve.setData(upper_x, upper_cp)
-        self.lower_curve.setData(lower_x, lower_cp)
-        self.boundary_overlay.setData(boundary_x, boundary_y)
+
+        if self.lower_cp_buffer is None or self.upper_cp_buffer is None:
+            self.lower_cp_buffer = np.zeros((10, lower_cp.shape[0]), dtype=np.float32)
+            self.upper_cp_buffer = np.zeros((10, upper_cp.shape[0]), dtype=np.float32)
+
+        self.upper_cp_buffer[0, :] = upper_cp
+        self.lower_cp_buffer[0, :] = lower_cp
+        self.upper_cp_buffer = np.roll(self.upper_cp_buffer, 1, axis=0)
+        self.lower_cp_buffer = np.roll(self.lower_cp_buffer, 1, axis=0)
+
+        avg_upper_cp = np.mean(self.upper_cp_buffer, axis=0)
+        avg_lower_cp = np.mean(self.lower_cp_buffer, axis=0)
+
+        self.upper_curve.setData(upper_x, avg_upper_cp)
+        self.lower_curve.setData(lower_x, avg_lower_cp)
         self.pressure_plot.setTitle(self._pressure_title(step, airfoil_angle_deg))
-        self._update_pressure_range(upper_cp, lower_cp)
+        self._update_pressure_range(avg_upper_cp, avg_lower_cp)
         self.app.processEvents()
 
     @staticmethod
     def _pressure_arrays(pressure_profile, boundary_layer_voxels):
         if pressure_profile is None:
             empty = np.asarray([], dtype=np.float32)
-            boundary_empty = np.asarray([], dtype=np.float32)
-            return empty, empty, empty, empty, boundary_empty, boundary_empty
+            return empty, empty, empty, empty
 
-        boundary_layer_voxels = _normalize_boundary_layer_voxels(boundary_layer_voxels)
         return (
             np.asarray(pressure_profile["upper_x"], dtype=np.float32),
             np.asarray(pressure_profile["upper_cp"], dtype=np.float32),
             np.asarray(pressure_profile["lower_x"], dtype=np.float32),
             np.asarray(pressure_profile["lower_cp"], dtype=np.float32),
-            boundary_layer_voxels[:, 2] if boundary_layer_voxels.size else np.asarray([], dtype=np.float32),
-            boundary_layer_voxels[:, 3] if boundary_layer_voxels.size else np.asarray([], dtype=np.float32),
         )
 
     @staticmethod
@@ -523,6 +552,7 @@ def _get_dashboard(flowfield_shape, voxel_size, flow_vmax):
             flow_vmax=flow_vmax,
         )
     return _WINDTUNNEL_DASHBOARD
+
 
 def post_process(
     step,
@@ -581,8 +611,12 @@ def plot_pressure_profile(
     plot.setLabel("left", "Pressure coefficient, C_p")
     plot.invertY(True)
 
-    upper_mask = np.isfinite(upper_chord_fraction) & np.isfinite(upper_pressure_coefficient)
-    lower_mask = np.isfinite(lower_chord_fraction) & np.isfinite(lower_pressure_coefficient)
+    upper_mask = np.isfinite(upper_chord_fraction) & np.isfinite(
+        upper_pressure_coefficient
+    )
+    lower_mask = np.isfinite(lower_chord_fraction) & np.isfinite(
+        lower_pressure_coefficient
+    )
 
     plot.plot(
         upper_chord_fraction[upper_mask],
@@ -637,6 +671,7 @@ def capture_pressure_profile(
     )
     return pressure_profile
 
+
 def plot_drag_coefficient(
     current_step, drag_coefficients: np.ndarray, lift_coefficients: np.ndarray
 ):
@@ -659,8 +694,18 @@ def plot_drag_coefficient(
     plot.setLabel("bottom", "Time step")
     plot.setLabel("left", "Coefficient")
     x = np.arange(current_step)
-    plot.plot(x, drag_coefficients[:current_step], pen=pg.mkPen("#c53030", width=2), name="Drag coefficient")
-    plot.plot(x, lift_coefficients[:current_step], pen=pg.mkPen("#2b6cb0", width=2), name="Lift coefficient")
+    plot.plot(
+        x,
+        drag_coefficients[:current_step],
+        pen=pg.mkPen("#c53030", width=2),
+        name="Drag coefficient",
+    )
+    plot.plot(
+        x,
+        lift_coefficients[:current_step],
+        pen=pg.mkPen("#2b6cb0", width=2),
+        name="Lift coefficient",
+    )
     plot.addLegend()
     plot.setTitle(f"Drag/Lift Coefficients (step {current_step})")
     print(
@@ -670,7 +715,17 @@ def plot_drag_coefficient(
     window.show()
     app.processEvents()
 
-def compute_forces(step, f_0, f_1, bc_mask, missing_mask, momentum_transfer, units, airfoil_chord_length):
+
+def compute_forces(
+    step,
+    f_0,
+    f_1,
+    bc_mask,
+    missing_mask,
+    momentum_transfer,
+    units,
+    airfoil_chord_length,
+):
     boundary_force = momentum_transfer(f_0, f_1, bc_mask, missing_mask)
     drag_lb = boundary_force[0]  # x-direction (lattice force)
     lift_lb = boundary_force[1]  # y-direction (lattice force)

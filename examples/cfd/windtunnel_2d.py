@@ -14,6 +14,7 @@ from xlb.operator.boundary_condition import (
     HalfwayBounceBackBC,
     ZouHeBC,
     ExtrapolationOutflowBC,
+    RegularizedBC,
     FullwayBounceBackBC,
 )
 
@@ -27,14 +28,14 @@ from helpers import (
 )
 
 # Simulation Configuration
-grid_shape = (500, 300)
+grid_shape = (1200, 1200)
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
 velocity_set = D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)
 
-domain_length_m = 0.5  # Physical domain size in meters (length x height)
-Re = 109000.0
+domain_length_m = 0.6  # Physical domain size in meters (length x height)
+Re = 50000.0
 air_kinematic_viscosity_m2ps = 1.511e-5
 sim_time = 5.0  # Total simulation time in seconds
 print_interval = 10000
@@ -42,12 +43,12 @@ output_interval = 100
 eval_start_step = 20000
 
 # Airfoil obstacle parameters (NACA 4-digit style)
-airfoil_chord_length = 0.13 # m
-airfoil_thickness = 0.02/airfoil_chord_length
-airfoil_camber = 0.1
+airfoil_chord_length = 0.13  # m
+airfoil_thickness = 0.02 / airfoil_chord_length
+airfoil_camber = 0.01
 airfoil_camber_position = 0.40
-airfoil_angle_deg = -5.0
-airfoil_x_position = 0.3
+airfoil_angle_deg = -30.0
+airfoil_x_position = 0.03
 airfoil_y_position = 0.5
 
 units = LBUnitConverter(
@@ -118,7 +119,10 @@ obstacle, obstacle_boundary_layer, obstacle_boundary_voxels = build_airfoil_indi
 ramp_steps = 50000  # Number of steps to ramp velocity (smooth inlet startup)
 max_u_lb = units.u_lb_inlet  # Target inlet velocity
 
-print(f"Inlet velocity will ramp from 0 to {max_u_lb} over {ramp_steps} steps ({ramp_steps*units.dt:.2f}s)")
+print(
+    f"Inlet velocity will ramp from 0 to {max_u_lb} over {ramp_steps} steps ({ramp_steps*units.dt:.2f}s)"
+)
+
 
 def get_inlet_velocity(step):
     """Smooth inlet ramp to suppress acoustic waves from sharp velocity step"""
@@ -127,14 +131,18 @@ def get_inlet_velocity(step):
         return max_u_lb * ramp_factor
     return max_u_lb
 
+
 # Update BC with dynamic velocity based on current step
 def update_inlet_bc(bc, step):
     """Update inlet BC velocity based on ramp"""
     current_vel = get_inlet_velocity(step)
     bc.prescribed_value = current_vel
-    bc.prescribed_values = jnp.array([current_vel], dtype=bc.precision_policy.store_precision.jax_dtype)
+    bc.prescribed_values = jnp.array(
+        [current_vel], dtype=bc.precision_policy.store_precision.jax_dtype
+    )
 
-bc_inlet = ZouHeBC(
+
+bc_inlet = RegularizedBC(
     "velocity",
     prescribed_value=(units.u_lb_inlet, 0.0),
     indices=inlet,
@@ -166,10 +174,10 @@ macro = Macroscopic(
 
 start_time = time.time()
 
-for _T in range(int(sim_time/units.dt)):
+for _T in range(int(sim_time / units.dt)):
     # Update inlet velocity ramp to suppress acoustic waves
     update_inlet_bc(bc_inlet, _T)
-    
+
     f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, omega, _T)
     f_0, f_1 = f_1, f_0
 
@@ -177,18 +185,20 @@ for _T in range(int(sim_time/units.dt)):
         if compute_backend == ComputeBackend.WARP:
             wp.synchronize()
         elapsed_time = time.time() - start_time
-        print(f"Iteration: {_T*units.dt:<10.2f}/{sim_time} | Time elapsed: {elapsed_time:.2f}s")
+        print(
+            f"Iteration: {_T*units.dt:0.2f}/{sim_time} | Time elapsed: {elapsed_time:.2f}s"
+        )
         start_time = time.time()
     if _T % output_interval == 0:
         post_process(
-        step=_T,
-        f_0=f_0,
-        macro=macro,
-        units=units,
-        obstacle_indices=obstacle,
-        boundary_layer_voxels=obstacle_boundary_voxels,
-        airfoil_angle_deg=airfoil_angle_deg,
-    )
+            step=_T,
+            f_0=f_0,
+            macro=macro,
+            units=units,
+            obstacle_indices=obstacle,
+            boundary_layer_voxels=obstacle_boundary_voxels,
+            airfoil_angle_deg=airfoil_angle_deg,
+        )
 
 
 print("Simulation completed successfully.")
