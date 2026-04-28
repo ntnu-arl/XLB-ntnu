@@ -16,8 +16,8 @@ class LBUnitConverter:
 
     grid_shape: tuple
     domain_size_m: tuple
-    wind_speed_mps: float
     chord_fraction: float
+    wind_speed_mps: Optional[float] = None
     reynolds_number: Optional[float] = None
     nu_m2ps: Optional[float] = None
     target_u_lb: float = 0.05
@@ -34,12 +34,31 @@ class LBUnitConverter:
 
         self.chord_m = self.chord_fraction * lx_m
 
+        if self.wind_speed_mps is None:
+            if self.nu_m2ps is None or self.reynolds_number is None:
+                raise ValueError(
+                    "When wind_speed_mps is omitted, provide both nu_m2ps and reynolds_number."
+                )
+            self.wind_speed_mps = self.reynolds_number * self.nu_m2ps / self.chord_m
+
         if self.nu_m2ps is None:
             if self.reynolds_number is None:
                 raise ValueError(
-                    "Provide either nu_m2ps or reynolds_number for physical scaling."
+                    "Provide reynolds_number to derive nu_m2ps from wind_speed_mps."
                 )
             self.nu_m2ps = self.wind_speed_mps * self.chord_m / self.reynolds_number
+
+        if self.wind_speed_mps is None:
+            raise ValueError("wind_speed_mps could not be determined.")
+
+        if self.nu_m2ps is None:
+            raise ValueError("nu_m2ps could not be determined.")
+
+        if self.wind_speed_mps <= 0.0:
+            raise ValueError("wind_speed_mps must be positive.")
+
+        if self.nu_m2ps <= 0.0:
+            raise ValueError("nu_m2ps must be positive.")
 
         # Choose dt such that inlet speed in lattice units stays low (low Mach number).
         self.dt = self.target_u_lb * self.dx / self.wind_speed_mps
@@ -101,6 +120,13 @@ def build_airfoil_indices(
     - y_position: vertical center position as fraction of domain height
 
     Uses a closed trailing edge thickness coefficient so the airfoil ends sharp.
+
+    Returns:
+    - boundary_indices: solid cells adjacent to at least one fluid cell
+    - boundary_layer_indices: fluid cells adjacent to the obstacle surface
+    - boundary_layer_chord_fraction: projected x/c position for boundary-layer cells
+    - boundary_layer_chord_distance: signed distance to chord line y/c for boundary-layer cells
+    - boundary_layer_side_flag: +1 for top side, -1 for bottom side
     """
     nx, ny = grid_shape
     chord = max(10, int(chord_fraction * nx))
@@ -138,6 +164,8 @@ def build_airfoil_indices(
     xl = x + yt * np.sin(theta)
     yl = yc - yt * np.cos(theta)
 
+    
+
     # Closed polygon: upper surface (LE->TE), then lower (TE->LE).
     x_poly = np.concatenate([xu, xl[::-1]])
     y_poly = np.concatenate([yu, yl[::-1]])
@@ -162,9 +190,80 @@ def build_airfoil_indices(
     xx, yy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
     cell_centers = np.column_stack([(xx.ravel() + 0.5), (yy.ravel() + 0.5)])
     inside = np.asarray(path.contains_points(cell_centers)).reshape(nx, ny)
+    obstacle_mask = inside
 
-    indices = np.stack(np.where(inside), axis=0).tolist()
-    return indices
+    boundary_layer_mask = np.zeros_like(obstacle_mask, dtype=bool)
+    neighbor_offsets = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+    obstacle_cells = np.stack(np.where(obstacle_mask), axis=1)
+
+    for x_idx, y_idx in obstacle_cells:
+        for dx, dy in neighbor_offsets:
+            neighbor_x = x_idx + dx
+            neighbor_y = y_idx + dy
+            if not (0 <= neighbor_x < nx and 0 <= neighbor_y < ny):
+                continue
+            if obstacle_mask[neighbor_x, neighbor_y]:
+                continue
+            boundary_layer_mask[neighbor_x, neighbor_y] = True
+
+    obstacle_indices = np.stack(np.where(obstacle_mask), axis=0).tolist()
+    boundary_layer_cells = np.stack(np.where(boundary_layer_mask), axis=1)
+    boundary_layer_indices = boundary_layer_cells.T.tolist()
+
+    if boundary_layer_cells.size == 0:
+        boundary_layer_chord_fraction = np.array([], dtype=np.float32)
+        boundary_layer_chord_distance = np.array([], dtype=np.float32)
+        boundary_layer_side_flag = np.array([], dtype=np.float32)
+    else:
+        chord_axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+        chord_normal = np.array([-np.sin(angle), np.cos(angle)], dtype=np.float32)
+        boundary_layer_centers = boundary_layer_cells.astype(np.float32) + 0.5
+        leading_edge = np.array([x_le, y_ref], dtype=np.float32)
+        relative_positions = boundary_layer_centers - leading_edge
+        boundary_layer_chord_fraction = (
+            relative_positions @ chord_axis / float(chord)
+        ).astype(np.float32)
+
+        local_x = (relative_positions @ chord_axis) / float(chord)
+        local_y = (relative_positions @ chord_normal) / float(chord)
+
+        upper_x = xu.astype(np.float32)
+        upper_y = yu.astype(np.float32)
+        lower_x = xl.astype(np.float32)
+        lower_y = yl.astype(np.float32)
+
+        upper_order = np.argsort(upper_x)
+        lower_order = np.argsort(lower_x)
+        upper_x = upper_x[upper_order]
+        upper_y = upper_y[upper_order]
+        lower_x = lower_x[lower_order]
+        lower_y = lower_y[lower_order]
+
+        upper_surface_y = np.interp(local_x, upper_x, upper_y)
+        lower_surface_y = np.interp(local_x, lower_x, lower_y)
+        camber_midline_y = 0.5 * (upper_surface_y + lower_surface_y)
+
+        boundary_layer_chord_distance = local_y
+        boundary_layer_side_flag = np.where(
+            local_y >= camber_midline_y,
+            1.0,
+            -1.0,
+        ).astype(np.float32)
+
+    boundary_layer_voxels = np.hstack(
+        [
+            boundary_layer_cells,
+            boundary_layer_chord_fraction.reshape(-1, 1),
+            boundary_layer_chord_distance.reshape(-1, 1),
+            boundary_layer_side_flag.reshape(-1, 1),
+        ]
+    )
+    return (
+        obstacle_indices,
+        boundary_layer_indices,
+        boundary_layer_voxels,
+    )
+
 
 
 def plot_simulation_setup(
@@ -201,7 +300,6 @@ def plot_simulation_setup(
     plot_mask[mask_2d == inlet_id] = 2
     plot_mask[mask_2d == outlet_id] = 3
     plot_mask[mask_2d == obstacle_id] = 4
-    plot_mask[mask_2d == 255] = 5
 
     fig, ax = plt.subplots(figsize=(12, 4.5))
     extent = (0.0, grid_shape[0] * voxel_size, 0.0, grid_shape[1] * voxel_size)
@@ -245,7 +343,7 @@ def plot_simulation_setup(
         Patch(facecolor="#dd6b20", edgecolor="none", label="Outlet"),
         Patch(facecolor="#c53030", edgecolor="none", label="Obstacle"),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", frameon=True)
+    ax.legend(handles=legend_handles, loc="lower right", frameon=True)
 
     ax.annotate(
         "",
@@ -306,46 +404,235 @@ def post_process(
         timestep=step,
         prefix=field_prefix,
         vmin=0,
-        vmax=units.wind_speed_mps * 2,
+        vmax=units.wind_speed_mps*1.5,
     )
 
-def plot_drag_coefficient(time_steps, drag_coefficients, lift_coefficients):
+
+def plot_pressure_profile(
+    upper_chord_fraction: np.ndarray,
+    upper_pressure_coefficient: np.ndarray,
+    lower_chord_fraction: np.ndarray,
+    lower_pressure_coefficient: np.ndarray,
+    boundary_layer_voxels: np.ndarray,
+    step: int,
+    airfoil_angle_deg: Optional[float] = None,
+    field_prefix: str = "out/pressure_profile",
+):
+    if upper_chord_fraction.size == 0 and lower_chord_fraction.size == 0:
+        return
+
+    fig, (ax_profile, ax_delta) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    upper_mask = np.isfinite(upper_chord_fraction) & np.isfinite(upper_pressure_coefficient)
+    lower_mask = np.isfinite(lower_chord_fraction) & np.isfinite(lower_pressure_coefficient)
+    ax_profile.plot(
+        upper_chord_fraction[upper_mask],
+        upper_pressure_coefficient[upper_mask],
+        color="#2b6cb0",
+        linewidth=1.8,
+        marker="o",
+        markersize=3,
+        alpha=0.9,
+        label="Upper surface",
+    )
+    ax_profile.plot(
+        lower_chord_fraction[lower_mask],
+        lower_pressure_coefficient[lower_mask],
+        color="#c53030",
+        linewidth=1.8,
+        marker="o",
+        markersize=3,
+        alpha=0.9,
+        label="Lower surface",
+    )
+    # Plot boundary-layer samples on a secondary y-axis for separate scaling.
+    ax_secondary = ax_profile.twinx()
+    ax_secondary.plot(
+        boundary_layer_voxels[:, 2],
+        -boundary_layer_voxels[:, 3]*1.0,  # Scale distance for visibility
+        color="gray",
+        linestyle="",
+        marker="o",
+        markersize=2,
+        alpha=0.5,
+        label="Boundary layer samples",
+    )
+    ax_secondary.set_ylabel("Boundary layer distance (scaled)")
+    ax_secondary.invert_yaxis()
+    ax_secondary.set_ylim(-0.3, 0.3)
+    ax_profile.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    ax_profile.invert_yaxis()
+    ax_profile.set_ylabel("Pressure coefficient $C_p$")
+    ax_profile.set_title(f"Airfoil pressure profile (step {step})")
+    ax_profile.grid(True, alpha=0.25)
+    # Combine legends from primary and secondary axes (if present).
+    handles1, labels1 = ax_profile.get_legend_handles_labels()
+    handles2, labels2 = ([], [])
+    try:
+        handles2, labels2 = ax_secondary.get_legend_handles_labels()
+    except NameError:
+        pass
+    if handles2:
+        ax_profile.legend(handles1 + handles2, labels1 + labels2, loc="best")
+    else:
+        ax_profile.legend(handles1, labels1, loc="best")
+
+    if np.count_nonzero(upper_mask) > 1 and np.count_nonzero(lower_mask) > 1:
+        xu = upper_chord_fraction[upper_mask]
+        cpu = upper_pressure_coefficient[upper_mask]
+        xl = lower_chord_fraction[lower_mask]
+        cpl = lower_pressure_coefficient[lower_mask]
+
+        upper_order = np.argsort(xu)
+        lower_order = np.argsort(xl)
+        xu = xu[upper_order]
+        cpu = cpu[upper_order]
+        xl = xl[lower_order]
+        cpl = cpl[lower_order]
+
+        xl_unique, xl_unique_idx = np.unique(xl, return_index=True)
+        cpl_unique = cpl[xl_unique_idx]
+
+        overlap_min = max(xu.min(), xl_unique.min())
+        overlap_max = min(xu.max(), xl_unique.max())
+        overlap_mask = (xu >= overlap_min) & (xu <= overlap_max)
+        if np.any(overlap_mask):
+            xu_overlap = xu[overlap_mask]
+            cpl_interp = np.interp(xu_overlap, xl_unique, cpl_unique)
+            pressure_difference = cpl_interp - cpu[overlap_mask]
+            ax_delta.plot(
+                xu_overlap,
+                pressure_difference,
+                color="#2f855a",
+                linewidth=1.8,
+                marker="o",
+                markersize=3,
+                alpha=0.9,
+            )
+
+    ax_delta.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    ax_delta.set_xlabel("Chord fraction, x/c")
+    ax_delta.set_ylabel(r"$\Delta C_p = C_{p,lower} - C_{p,upper}$")
+    ax_delta.grid(True, alpha=0.25)
+    if airfoil_angle_deg is not None:
+        ax_profile.set_title(
+            f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
+        )
+    else:
+        ax_profile.set_title(f"Airfoil pressure profile (step {step})")
+    fig.tight_layout()
+    fig.savefig(f"{field_prefix}_{step:06d}.png", dpi=200)
+    plt.close(fig)
+
+
+def capture_pressure_profile(
+    step,
+    f_0,
+    macro,
+    units,
+    boundary_layer_voxels,
+    airfoil_angle_deg,
+    field_prefix="out/pressure_profile",
+):
+    if not isinstance(f_0, jnp.ndarray):
+        f_0_jax = wp.to_jax(f_0)
+    else:
+        f_0_jax = f_0
+
+    rho, _ = macro(f_0_jax)
+    rho = rho[:, 1:-1, 1:-1, 0]
+    rho_mean = rho.mean()
+    pressure = units.pressure_fluctuation_to_si(rho[0])-units.pressure_fluctuation_to_si(rho_mean)  # Subtract reference pressure to get actual pressure distribution.
+
+    q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
+    pressure_coefficient = np.asarray(pressure / q_inf)
+
+    boundary_layer_voxels = np.asarray(boundary_layer_voxels, dtype=np.float32)
+    if boundary_layer_voxels.ndim != 2 or boundary_layer_voxels.shape[1] < 5:
+        raise ValueError(
+            "boundary_layer_voxels must be shaped like [N, 5] with columns [x, y, x/c, y/c, side]."
+        )
+
+    if boundary_layer_voxels.size == 0:
+        return None
+
+    sample_x = boundary_layer_voxels[:, 0].astype(np.int32)
+    sample_y = boundary_layer_voxels[:, 1].astype(np.int32)
+    chord_fraction = boundary_layer_voxels[:, 2].astype(np.float32)
+    side_flag = boundary_layer_voxels[:, 4].astype(np.float32)
+
+    sample_values = pressure_coefficient[sample_x, sample_y]
+
+    finite_chord_mask = np.isfinite(chord_fraction)
+    if not np.any(finite_chord_mask):
+        return None
+
+    upper_mask = side_flag > 0.0
+    lower_mask = side_flag < 0.0
+
+    upper_x = chord_fraction[upper_mask]
+    upper_cp = sample_values[upper_mask]
+    lower_x = chord_fraction[lower_mask]
+    lower_cp = sample_values[lower_mask]
+
+    if upper_x.size == 0 or lower_x.size == 0:
+        return None
+
+    upper_order = np.argsort(upper_x)
+    lower_order = np.argsort(lower_x)
+
+    upper_x = upper_x[upper_order]
+    upper_cp = upper_cp[upper_order]
+    lower_x = lower_x[lower_order]
+    lower_cp = lower_cp[lower_order]
+
+    plot_pressure_profile(
+        upper_x,
+        upper_cp,
+        lower_x,
+        lower_cp,
+        boundary_layer_voxels,
+        step=step,
+        airfoil_angle_deg=airfoil_angle_deg,
+        field_prefix=field_prefix,
+    )
+
+    return upper_x, upper_cp, lower_x, lower_cp
+
+def plot_drag_coefficient(
+    current_step, drag_coefficients: np.ndarray, lift_coefficients: np.ndarray
+):
     """
-    Plot the drag coefficient with various moving averages.
+    Plot drag/lift coefficients after batch-averaging samples.
 
     Args:
-        time_steps (list): List of time steps.
-        drag_coefficients (list): List of drag coefficients.
+        current_step (int): Current timestep used for plot context.
+        drag_coefficients (np.array): List of drag coefficients.
+        lift_coefficients (np.array): List of lift coefficients.
     """
     # Convert lists to numpy arrays for processing
-    time_steps_np = np.array(time_steps)
-    drag_coefficients_np = np.array(drag_coefficients)
-    lift_coefficients_np = np.array(lift_coefficients)
 
-    # Define moving average windows
-    windows = [10, 100, 1000, 10000, 100000]
-    labels = ["MA 10", "MA 100", "MA 1,000", "MA 10,000", "MA 100,000"]
+    if current_step <= 0:
+        return
+
+    x = np.arange(current_step)
 
     plt.figure(figsize=(12, 8))
-    plt.plot(
-        time_steps_np, drag_coefficients_np, label="Raw Drag Coefficient", alpha=0.5
-    )
-    plt.plot(
-        time_steps_np, lift_coefficients_np, label="Raw Lift Coefficient", alpha=0.5
+    plt.plot(x, drag_coefficients[:current_step], label="Drag Coefficient", color="red", alpha=0.3)
+    plt.hlines(drag_coefficients[:current_step].mean(), 0, current_step, colors="red", linestyles="dashed", label="Drag Coefficient Mean")
+    plt.plot(x, lift_coefficients[:current_step], label="Lift Coefficient", color="blue", alpha=0.3)
+    plt.hlines(lift_coefficients[:current_step].mean(), 0, current_step, colors="blue", linestyles="dashed", label="Lift Coefficient Mean")
+
+    print(
+        f"Batch-averaged Drag Coefficient: {drag_coefficients[:current_step].mean():.4f}, "
+        f"Lift Coefficient: {lift_coefficients[:current_step].mean():.4f}"
     )
 
-    for window, label in zip(windows, labels):
-        if len(drag_coefficients_np) >= window:
-            ma = np.convolve(
-                drag_coefficients_np, np.ones(window) / window, mode="valid"
-            )
-            plt.plot(time_steps_np[window - 1 :], ma, label=label)
 
     plt.ylim(-2.0, 2.0)
     plt.legend()
     plt.xlabel("Time step")
     plt.ylabel("Drag coefficient")
-    plt.title("Drag Coefficient Over Time with Moving Averages")
+    plt.title(f"Drag/Lift Coefficients (Batch-Averaged, step {current_step})")
     plt.savefig("out/drag_coefficient_ma.png")
     plt.close()
 
@@ -361,8 +648,5 @@ def compute_forces(step, f_0, f_1, bc_mask, missing_mask, momentum_transfer, uni
     q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
     cd = drag_n_per_m / (q_inf * airfoil_chord_length)
     cl = lift_n_per_m / (q_inf * airfoil_chord_length)
-    print(
-        f"Step {step}: Drag = {drag_n_per_m:.6f} N/m, Lift = {lift_n_per_m:.6f} N/m, "
-        f"Cd = {cd:.4f}, Cl = {cl:.4f}"
-    )
+
     return cd, cl

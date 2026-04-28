@@ -20,44 +20,56 @@ from xlb.operator.boundary_condition import (
 from xlb.operator.force.momentum_transfer import MomentumTransfer
 from xlb.operator.macroscopic import Macroscopic
 
-from helpers import LBUnitConverter
-from helpers import build_airfoil_indices, plot_simulation_setup, post_process, compute_forces
+from helpers import (
+    LBUnitConverter,
+    capture_pressure_profile,
+    build_airfoil_indices,
+    plot_simulation_setup,
+    post_process,
+    compute_forces,
+    plot_drag_coefficient,
+)
 
 # Simulation Configuration
-grid_shape = (1500, 900)
+grid_shape = (2000, 2000)
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
 velocity_set = D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)
 
-domain_size_m = (1.5, 0.9)
-wind_speed_mps = 10.0
-Re = 80000.0
-num_steps = 500000
+domain_size_m = (0.8, 0.8)  # Physical domain size in meters (length x height)
+Re = 50000.0
+air_kinematic_viscosity_m2ps = 1.5e-5
+num_steps = 30000
 print_interval = 10000
-output_interval = 100
-eval_interval = 1000
+output_interval = 1000
+eval_start_step = 20000
 
 # Airfoil obstacle parameters (NACA 4-digit style)
-airfoil_chord_length = 0.30
-airfoil_thickness = 0.15
-airfoil_camber = 0.05
+airfoil_chord_length = 0.30 # m
+airfoil_thickness = 0.14
+airfoil_camber = 0.07
 airfoil_camber_position = 0.40
-airfoil_angle_deg = -90.0
-airfoil_x_position = 0.25
-airfoil_y_position = 0.70
+airfoil_angle_deg = -25.0
+airfoil_x_position = 0.3
+airfoil_y_position = 0.6
+
+cd = np.zeros(num_steps - eval_start_step)
+cl = np.zeros(num_steps - eval_start_step)
 
 units = LBUnitConverter(
     grid_shape=grid_shape,
     domain_size_m=domain_size_m,
-    wind_speed_mps=wind_speed_mps,
+    wind_speed_mps=None,
     chord_fraction=airfoil_chord_length / domain_size_m[0],
     reynolds_number=Re,
+    nu_m2ps=air_kinematic_viscosity_m2ps,
     target_u_lb=0.05,
 )
 
 voxel_size = units.dx
 clength = units.chord_m
+wind_speed_mps = units.wind_speed_mps
 visc = units.nu_m2ps
 omega = units.omega
 
@@ -73,9 +85,9 @@ print(f"Precision policy: {precision_policy}")
 print(f"Domain size [m]: {domain_size_m[0]} x {domain_size_m[1]}")
 print(f"Grid spacing dx [m]: {units.dx}")
 print(f"Time step dt [s]: {units.dt}")
-print(f"Prescribed velocity [m/s]: {wind_speed_mps}")
+print(f"Kinematic viscosity nu [m^2/s]: {visc}")
 print(f"Reynolds number: {Re}")
-print(f"Physical kinematic viscosity nu [m^2/s]: {visc}")
+print(f"Computed freestream velocity [m/s]: {wind_speed_mps}")
 print(f"Lattice inlet velocity u_lb: {units.u_lb_inlet}")
 print(f"Lattice viscosity nu_lb: {units.nu_lb}")
 print(f"Relaxation time tau: {units.tau}")
@@ -99,7 +111,7 @@ outlet = box_no_edge["right"]
 walls = [box["bottom"][i] + box["top"][i] for i in range(velocity_set.d)]
 walls = np.unique(np.array(walls), axis=-1).tolist()
 
-obstacle_indices = build_airfoil_indices(
+obstacle, obstacle_boundary_layer, obstacle_boundary_voxels = build_airfoil_indices(
     grid_shape,
     chord_fraction=airfoil_chord_length / domain_size_m[0],
     thickness=airfoil_thickness,
@@ -116,10 +128,11 @@ bc_inlet = RegularizedBC(
     indices=inlet,
 )
 bc_outlet = ExtrapolationOutflowBC(indices=outlet)
-bc_walls = FullwayBounceBackBC(indices=walls)
-bc_obstacle = HalfwayBounceBackBC(indices=obstacle_indices)
+bc_walls = ExtrapolationOutflowBC(indices=walls)
+bc_obstacle = HalfwayBounceBackBC(indices=obstacle)
 
-boundary_conditions = [bc_walls, bc_inlet, bc_outlet, bc_obstacle]
+
+boundary_conditions = [bc_inlet, bc_outlet, bc_walls, bc_obstacle]
 
 stepper = IncompressibleNavierStokesStepper(
     grid=grid,
@@ -140,7 +153,6 @@ plot_simulation_setup(
 )
 
 # Setup Momentum Transfer for Force Calculation
-bc_obstacle = boundary_conditions[-1]
 momentum_transfer = MomentumTransfer(bc_obstacle, compute_backend=compute_backend)
 
 macro = Macroscopic(
@@ -169,18 +181,14 @@ for step in range(num_steps):
             macro,
             units,
         )
-    if step % eval_interval == 0:
-        # Perform evaluation or analysis at specified intervals
-        compute_forces(
+        capture_pressure_profile(
             step,
             f_0,
-            f_1,
-            bc_mask,
-            missing_mask,
-            momentum_transfer,
+            macro,
             units,
-            airfoil_chord_length,
+            obstacle_boundary_voxels,
+            airfoil_angle_deg,
         )
-        pass
+
 
 print("Simulation completed successfully.")
