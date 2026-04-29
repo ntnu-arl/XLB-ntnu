@@ -9,13 +9,14 @@ from xlb.compute_backend import ComputeBackend
 from xlb.precision_policy import PrecisionPolicy
 from xlb.grid import grid_factory
 from xlb.velocity_set import D2Q9
-from xlb.operator.stepper import IncompressibleNavierStokesStepper
+from xlb.operator.stepper import IncompressibleNavierStokesStepper, IBMStepper
 from xlb.operator.boundary_condition import (
     HalfwayBounceBackBC,
     ZouHeBC,
     ExtrapolationOutflowBC,
     RegularizedBC,
     FullwayBounceBackBC,
+    DoNothingBC,
 )
 
 from xlb.operator.force.momentum_transfer import MomentumTransfer
@@ -35,7 +36,7 @@ precision_policy = PrecisionPolicy.FP32FP32
 velocity_set = D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)
 
 domain_length_m = 0.6  # Physical domain size in meters (length x height)
-Re = 50000.0
+Re = 100000.0
 air_kinematic_viscosity_m2ps = 1.511e-5
 sim_time = 5.0  # Total simulation time in seconds
 print_interval = 10000
@@ -45,11 +46,11 @@ eval_start_step = 20000
 # Airfoil obstacle parameters (NACA 4-digit style)
 airfoil_chord_length = 0.13  # m
 airfoil_thickness = 0.02 / airfoil_chord_length
-airfoil_camber = 0.01
+airfoil_camber = 0.08
 airfoil_camber_position = 0.40
-airfoil_angle_deg = -30.0
-airfoil_x_position = 0.03
-airfoil_y_position = 0.5
+airfoil_angle_deg = -90.0
+airfoil_x_position = 0.5
+airfoil_y_position = 0.6
 
 units = LBUnitConverter(
     grid_shape=grid_shape,
@@ -115,40 +116,14 @@ obstacle, obstacle_boundary_layer, obstacle_boundary_voxels = build_airfoil_indi
     y_position=airfoil_y_position,
 )
 
-# Create a dynamic inlet profile with velocity ramp to suppress acoustic waves
-ramp_steps = 50000  # Number of steps to ramp velocity (smooth inlet startup)
-max_u_lb = units.u_lb_inlet  # Target inlet velocity
-
-print(
-    f"Inlet velocity will ramp from 0 to {max_u_lb} over {ramp_steps} steps ({ramp_steps*units.dt:.2f}s)"
-)
-
-
-def get_inlet_velocity(step):
-    """Smooth inlet ramp to suppress acoustic waves from sharp velocity step"""
-    if step < ramp_steps:
-        ramp_factor = step / ramp_steps
-        return max_u_lb * ramp_factor
-    return max_u_lb
-
-
-# Update BC with dynamic velocity based on current step
-def update_inlet_bc(bc, step):
-    """Update inlet BC velocity based on ramp"""
-    current_vel = get_inlet_velocity(step)
-    bc.prescribed_value = current_vel
-    bc.prescribed_values = jnp.array(
-        [current_vel], dtype=bc.precision_policy.store_precision.jax_dtype
-    )
-
 
 bc_inlet = RegularizedBC(
     "velocity",
     prescribed_value=(units.u_lb_inlet, 0.0),
     indices=inlet,
 )
-bc_outlet = ExtrapolationOutflowBC(indices=outlet)
-bc_walls = ExtrapolationOutflowBC(indices=walls)
+bc_outlet = DoNothingBC(indices=outlet)
+bc_walls = DoNothingBC(indices=walls)
 bc_obstacle = HalfwayBounceBackBC(indices=obstacle)
 
 
@@ -163,7 +138,7 @@ stepper = IncompressibleNavierStokesStepper(
 f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
 
 # Setup Momentum Transfer for Force Calculation
-momentum_transfer = MomentumTransfer(bc_obstacle, compute_backend=compute_backend)
+
 macro = Macroscopic(
     compute_backend=ComputeBackend.JAX,
     precision_policy=precision_policy,
@@ -175,8 +150,6 @@ macro = Macroscopic(
 start_time = time.time()
 
 for _T in range(int(sim_time / units.dt)):
-    # Update inlet velocity ramp to suppress acoustic waves
-    update_inlet_bc(bc_inlet, _T)
 
     f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, omega, _T)
     f_0, f_1 = f_1, f_0
