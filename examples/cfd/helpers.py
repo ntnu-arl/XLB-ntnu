@@ -113,7 +113,7 @@ def build_airfoil_indices(
     angle_deg=-10.0,
     x_position=0.25,
     y_position=0.50,
-    naca_points=800,
+    naca_points=1000,
 ):
     """Build a rasterized NACA 4-digit style airfoil obstacle on the grid.
 
@@ -130,9 +130,10 @@ def build_airfoil_indices(
     Returns:
     - boundary_indices: solid cells adjacent to at least one fluid cell
     - boundary_layer_indices: fluid cells adjacent to the obstacle surface
-        - boundary_layer_voxels: [x, y, x/c, y/c, side, n_x, n_y], where
-            side is +1 for top side, -1 for bottom side
-            and (n_x, n_y) is the estimated outward unit surface normal in grid coordinates
+    - boundary_layer_voxels: [x, y, x/c, y/c, side, n_x, n_y, ds], where
+        side is +1 for upper surface, -1 for lower surface
+        (n_x, n_y) is the estimated outward unit surface normal in grid coordinates
+        ds is the surface element length for proper pressure integration
     """
     nx, ny = grid_shape
     chord = max(10, int(chord_fraction * nx))
@@ -147,7 +148,7 @@ def build_airfoil_indices(
             - 0.1260 * x
             - 0.3516 * x**2
             + 0.2843 * x**3
-            - 0.1036 * x**4
+            - 0.1015 * x**4
         )
     )
 
@@ -206,6 +207,10 @@ def build_airfoil_indices(
         (1, -1),
         (-1, 1),
         (-1, -1),
+        (2, 0),
+        (-2, 0),
+        (0, 2),
+        (0, -2),
     )
     obstacle_cells = np.stack(np.where(obstacle_mask), axis=1)
 
@@ -295,6 +300,34 @@ def build_airfoil_indices(
         normal_local_x * chord_axis[1] + normal_local_y * chord_normal[1]
     ).astype(np.float32)
 
+    # Calculate arc lengths of upper and lower surfaces.
+    # Use the sorted upper_x, upper_y and lower_x, lower_y arrays.
+    upper_dx_curve = np.diff(upper_x, prepend=upper_x[0])
+    upper_dy_curve = np.diff(upper_y, prepend=upper_y[0])
+    upper_ds_curve = np.sqrt(upper_dx_curve**2 + upper_dy_curve**2)
+    upper_arc_length = np.sum(upper_ds_curve)
+
+    lower_dx_curve = np.diff(lower_x, prepend=lower_x[0])
+    lower_dy_curve = np.diff(lower_y, prepend=lower_y[0])
+    lower_ds_curve = np.sqrt(lower_dx_curve**2 + lower_dy_curve**2)
+    lower_arc_length = np.sum(lower_ds_curve)
+
+    # Count number of boundary voxels on each side.
+    num_upper = np.sum(boundary_layer_side_flag > 0.0)
+    num_lower = np.sum(boundary_layer_side_flag < 0.0)
+
+    # Compute surface element length (ds) for each side.
+    # This is the arc length divided by the number of voxels on that side.
+    dx_upper = float(upper_arc_length) / max(1, num_upper)
+    dx_lower = float(lower_arc_length) / max(1, num_lower)
+
+    # Map each boundary voxel to its corresponding ds value based on side flag.
+    boundary_layer_ds = np.where(
+        boundary_layer_side_flag > 0.0,
+        dx_upper,
+        dx_lower,
+    ).astype(np.float32)
+
     boundary_layer_voxels = np.hstack(
         [
             boundary_layer_cells,
@@ -303,6 +336,7 @@ def build_airfoil_indices(
             boundary_layer_side_flag.reshape(-1, 1),
             boundary_layer_normal_x.reshape(-1, 1),
             boundary_layer_normal_y.reshape(-1, 1),
+            boundary_layer_ds.reshape(-1, 1),
         ]
     )
     return (
@@ -335,14 +369,14 @@ def _to_numpy(array):
 
 def _normalize_boundary_layer_voxels(boundary_layer_voxels):
     if boundary_layer_voxels is None:
-        return np.empty((0, 7), dtype=np.float32)
+        return np.empty((0, 8), dtype=np.float32)
 
     array = np.asarray(boundary_layer_voxels, dtype=np.float32)
     if array.size == 0:
-        return np.empty((0, 7), dtype=np.float32)
+        return np.empty((0, 8), dtype=np.float32)
     if array.ndim != 2 or array.shape[1] < 5:
         raise ValueError(
-            "boundary_layer_voxels must be shaped like [N, >=5] with columns [x, y, x/c, y/c, side, (optional n_x, n_y)]."
+            "boundary_layer_voxels must be shaped like [N, >=5] with columns [x, y, x/c, y/c, side, (optional n_x, n_y, ds)]."
         )
     return array
 
@@ -359,8 +393,9 @@ def _extract_windtunnel_diagnostics(
     rho = rho[:, 1:-1, 1:-1, 0]
     u = u[:, 1:-1, 1:-1, 0]
 
+    print(rho.mean(), rho.min(), rho.max())
+
     flowfield = _to_numpy(units.to_si_velocity(jnp.sqrt(u[0] ** 2 + u[1] ** 2)))
-    # flowfield = _to_numpy(units.to_si_velocity(u[1]))
 
     wind_speed_mps = units.wind_speed_mps
     if wind_speed_mps is None:
@@ -386,7 +421,9 @@ def _extract_windtunnel_diagnostics(
     side_flag = boundary_layer_voxels[:, 4].astype(np.float32)
     sample_values = pressure_coefficient[sample_x, sample_y]
 
-    force = compute_forces_from_boundary_voxels(pressure, boundary_layer_voxels, units)
+    force = compute_forces_from_boundary_voxels(
+        pressure_coefficient, boundary_layer_voxels, units, q_inf
+    )
 
     upper_mask = side_flag > 0.0
     lower_mask = side_flag < 0.0
@@ -410,14 +447,14 @@ def _extract_windtunnel_diagnostics(
 
 
 class WindTunnelDashboard:
-    def __init__(self, flowfield_shape, voxel_size, flow_vmax=None):
+    def __init__(self, flowfield_shape, voxel_size):
         _require_pyqtgraph()
         self.app = pg.mkQApp("XLB Wind Tunnel Dashboard")
         self.window = pg.GraphicsLayoutWidget(title="XLB Wind Tunnel Dashboard")
-        self.window.resize(1600, 900)
+        self.window.resize(2000, 1000)
         self.flowfield_shape = tuple(flowfield_shape)
         self.voxel_size = voxel_size
-        self.flow_vmax = flow_vmax
+        self.flow_scaling = np.zeros(2, dtype=np.float32)
         self._counter = 0
 
         self.flow_plot = self.window.addPlot(row=0, col=0, rowspan=2)
@@ -440,11 +477,15 @@ class WindTunnelDashboard:
         )
         self.flow_plot.addItem(self.airfoil_overlay)
 
+        self.curve_length = 200
+        self.cp_buffer_size = 10
+        self.cld_buffer_size = 100
         self.upper_cp_buffer = None
         self.lower_cp_buffer = None
-        self.curve_length = 200
-        self.drag_curve_data = None
-        self.lift_curve_data = None
+        self.lift_coef_buffer = np.zeros((self.cld_buffer_size,), dtype=np.float32)
+        self.drag_coef_buffer = np.zeros((self.cld_buffer_size,), dtype=np.float32)
+        self.drag_curve_data = np.zeros((self.curve_length,), dtype=np.float32)
+        self.lift_curve_data = np.zeros((self.curve_length,), dtype=np.float32)
 
         # BC contour overlays for walls, inlet, outlet, obstacle
         self.wall_contour = pg.PlotCurveItem(pen=pg.mkPen("#2b6cb0", width=2))
@@ -467,7 +508,7 @@ class WindTunnelDashboard:
             [],
             pen=pg.mkPen("#2b6cb0", width=2),
             symbol="o",
-            symbolSize=5,
+            symbolSize=2,
             name="Upper surface",
         )
         self.lower_curve = self.pressure_plot.plot(
@@ -475,21 +516,12 @@ class WindTunnelDashboard:
             [],
             pen=pg.mkPen("#c53030", width=2),
             symbol="o",
-            symbolSize=5,
+            symbolSize=2,
             name="Lower surface",
-        )
-        self.boundary_overlay = self.pressure_plot.plot(
-            [],
-            [],
-            pen=None,
-            symbol="o",
-            symbolSize=4,
-            symbolBrush=pg.mkBrush(120, 120, 120, 120),
-            name="Boundary samples",
         )
 
         self.coefficient_plot = self.window.addPlot(row=1, col=1)
-        self.coefficient_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.coefficient_plot.showGrid(x=True, y=True, alpha=0.5)
         self.coefficient_plot.setLabel("bottom", "Time step")
         self.coefficient_plot.setLabel("left", "Coefficient")
         self.coefficient_plot.addLegend()
@@ -497,7 +529,7 @@ class WindTunnelDashboard:
         self.drag_curve = self.coefficient_plot.plot(
             [],
             [],
-            pen=pg.mkPen("#c53030", width=2),
+            pen=pg.mkPen("#c53030", width=4),
             symbol="o",
             symbolSize=1,
             name="Drag coefficient",
@@ -505,7 +537,7 @@ class WindTunnelDashboard:
         self.lift_curve = self.coefficient_plot.plot(
             [],
             [],
-            pen=pg.mkPen("#2b6cb0", width=2),
+            pen=pg.mkPen("#2b6cb0", width=4),
             symbol="o",
             symbolSize=1,
             name="Lift coefficient",
@@ -529,12 +561,7 @@ class WindTunnelDashboard:
             raise ValueError("flowfield must be a 2D array of velocity magnitudes.")
 
         self.flow_image.setImage(flowfield_np.T, autoLevels=False)
-        vmax = (
-            self.flow_vmax
-            if self.flow_vmax is not None
-            else float(np.amax(flowfield_np))
-        ) * 1.34  # Add some headroom for visualization
-        self.flow_image.setLevels((0.0, max(vmax, 1.0e-6)))
+        self._update_flowfield_range(flowfield_np)
         self.flow_plot.setXRange(0.0, flowfield_np.shape[0], padding=0.0)
         self.flow_plot.setYRange(0.0, flowfield_np.shape[1], padding=0.0)
         self.flow_plot.setTitle(f"Flowfield magnitude (step {step})")
@@ -545,8 +572,12 @@ class WindTunnelDashboard:
         )
 
         if self.lower_cp_buffer is None or self.upper_cp_buffer is None:
-            self.lower_cp_buffer = np.zeros((10, lower_cp.shape[0]), dtype=np.float32)
-            self.upper_cp_buffer = np.zeros((10, upper_cp.shape[0]), dtype=np.float32)
+            self.lower_cp_buffer = np.zeros(
+                (self.cp_buffer_size, lower_cp.shape[0]), dtype=np.float32
+            )
+            self.upper_cp_buffer = np.zeros(
+                (self.cp_buffer_size, upper_cp.shape[0]), dtype=np.float32
+            )
 
         self.upper_cp_buffer[0, :] = upper_cp
         self.lower_cp_buffer[0, :] = lower_cp
@@ -561,14 +592,15 @@ class WindTunnelDashboard:
         self.pressure_plot.setTitle(self._pressure_title(step, airfoil_angle_deg))
         self._update_pressure_range(avg_upper_cp, avg_lower_cp)
 
-        if self.lift_curve_data is None or self.drag_curve_data is None:
-            self.lift_curve_data = np.zeros((self.curve_length,), dtype=np.float32)
-            self.drag_curve_data = np.zeros((self.curve_length,), dtype=np.float32)
+        self.lift_coef_buffer[0] = lift_coefficient
+        self.lift_coef_buffer = np.roll(self.lift_coef_buffer, 1)
+        self.drag_coef_buffer[0] = drag_coefficient
+        self.drag_coef_buffer = np.roll(self.drag_coef_buffer, 1)
 
         self.lift_curve_data = np.roll(self.lift_curve_data, 1)
+        self.lift_curve_data[0] = self.lift_coef_buffer.mean()
         self.drag_curve_data = np.roll(self.drag_curve_data, 1)
-        self.lift_curve_data[0] = lift_coefficient
-        self.drag_curve_data[0] = drag_coefficient
+        self.drag_curve_data[0] = self.drag_coef_buffer.mean()
 
         _step = min(self._counter, self.curve_length)
         self.lift_curve.setData(-np.arange(-_step, 0), self.lift_curve_data[:_step])
@@ -601,6 +633,17 @@ class WindTunnelDashboard:
         if airfoil_angle_deg is None:
             return f"Airfoil pressure profile (step {step})"
         return f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
+
+    def _update_flowfield_range(self, flowfield):
+        finite_values = flowfield[np.isfinite(flowfield)]
+        if finite_values.size == 0:
+            return
+        vmax = max(self.flow_scaling[1], float(np.max(finite_values)))
+        vmin = min(self.flow_scaling[0], float(np.min(finite_values)))
+        self.flow_scaling[0] = vmin * 0.99
+        self.flow_scaling[1] = vmax * 0.99
+        padding = max(0.05 * (vmax - vmin), 0.05)
+        self.flow_image.setLevels((vmin - padding, vmax + padding))
 
     def _update_pressure_range(self, upper_cp, lower_cp):
         finite_values = np.concatenate(
@@ -649,7 +692,6 @@ def _get_dashboard(flowfield_shape, voxel_size, flow_vmax):
         _WINDTUNNEL_DASHBOARD = WindTunnelDashboard(
             flowfield_shape=flowfield_shape,
             voxel_size=voxel_size,
-            flow_vmax=flow_vmax,
         )
     return _WINDTUNNEL_DASHBOARD
 
@@ -670,12 +712,7 @@ def post_process(
         boundary_layer_voxels=boundary_layer_voxels,
     )
 
-    lift_coefficient = None
-    drag_coefficient = None
-    if force is not None:
-        lift_coefficient, drag_coefficient = compute_lift_drag_coefficients(
-            force, airfoil_angle_deg, units
-        )
+    lift_coefficient, drag_coefficient = compute_lift_drag_coefficients(force, units)
 
     dashboard = _get_dashboard(
         flowfield_shape=flowfield.shape,
@@ -700,134 +737,47 @@ def post_process(
     }
 
 
-def plot_pressure_profile(
-    upper_chord_fraction: np.ndarray,
-    upper_pressure_coefficient: np.ndarray,
-    lower_chord_fraction: np.ndarray,
-    lower_pressure_coefficient: np.ndarray,
-    boundary_layer_voxels: np.ndarray,
-    step: int,
-    airfoil_angle_deg: Optional[float] = None,
-    field_prefix: str = "out/pressure_profile",
-):
-    _require_pyqtgraph()
-    boundary_layer_voxels = _normalize_boundary_layer_voxels(boundary_layer_voxels)
-
-    app = pg.mkQApp("XLB Airfoil Pressure Profile")
-    window = pg.GraphicsLayoutWidget(title="Airfoil Pressure Profile")
-    window.resize(1000, 700)
-    plot = window.addPlot()
-    plot.showGrid(x=True, y=True, alpha=0.2)
-    plot.setLabel("bottom", "Chord fraction, x/c")
-    plot.setLabel("left", "Pressure coefficient, C_p")
-    plot.invertY(True)
-
-    upper_mask = np.isfinite(upper_chord_fraction) & np.isfinite(
-        upper_pressure_coefficient
-    )
-    lower_mask = np.isfinite(lower_chord_fraction) & np.isfinite(
-        lower_pressure_coefficient
-    )
-
-    plot.plot(
-        upper_chord_fraction[upper_mask],
-        upper_pressure_coefficient[upper_mask],
-        pen=pg.mkPen("#2b6cb0", width=2),
-        symbol="o",
-        symbolSize=5,
-        name="Upper surface",
-    )
-    plot.plot(
-        lower_chord_fraction[lower_mask],
-        lower_pressure_coefficient[lower_mask],
-        pen=pg.mkPen("#c53030", width=2),
-        symbol="o",
-        symbolSize=5,
-        name="Lower surface",
-    )
-
-    if boundary_layer_voxels.size > 0:
-        plot.plot(
-            boundary_layer_voxels[:, 2],
-            -boundary_layer_voxels[:, 3],
-            pen=None,
-            symbol="o",
-            symbolSize=4,
-            symbolBrush=pg.mkBrush(120, 120, 120, 120),
-            name="Boundary samples",
-        )
-
-    plot.addLegend()
-    plot.setTitle(
-        f"Airfoil pressure profile (step {step}, angle {airfoil_angle_deg:.1f}°)"
-        if airfoil_angle_deg is not None
-        else f"Airfoil pressure profile (step {step})"
-    )
-
-    window.show()
-    app.processEvents()
-
-
-def plot_drag_coefficient(
-    current_step, drag_coefficients: np.ndarray, lift_coefficients: np.ndarray
-):
-    """
-    Plot drag/lift coefficients after batch-averaging samples.
-
-    Args:
-        current_step (int): Current timestep used for plot context.
-        drag_coefficients (np.array): List of drag coefficients.
-        lift_coefficients (np.array): List of lift coefficients.
-    """
-    if current_step <= 0:
-        return
-    _require_pyqtgraph()
-    app = pg.mkQApp("XLB Drag/Lift Coefficients")
-    window = pg.GraphicsLayoutWidget(title="Drag/Lift Coefficients")
-    window.resize(1000, 500)
-    plot = window.addPlot()
-    plot.showGrid(x=True, y=True, alpha=0.2)
-    plot.setLabel("bottom", "Time step")
-    plot.setLabel("left", "Coefficient")
-    x = np.arange(current_step)
-    plot.plot(
-        x,
-        drag_coefficients[:current_step],
-        pen=pg.mkPen("#c53030", width=2),
-        name="Drag coefficient",
-    )
-    plot.plot(
-        x,
-        lift_coefficients[:current_step],
-        pen=pg.mkPen("#2b6cb0", width=2),
-        name="Lift coefficient",
-    )
-    plot.addLegend()
-    plot.setTitle(f"Drag/Lift Coefficients (step {current_step})")
-    print(
-        f"Batch-averaged Drag Coefficient: {drag_coefficients[:current_step].mean():.4f}, "
-        f"Lift Coefficient: {lift_coefficients[:current_step].mean():.4f}"
-    )
-    window.show()
-    app.processEvents()
-
-
 def compute_forces_from_boundary_voxels(
-    pressure_field,
+    pressure_coefficient_field,
     boundary_layer_voxels,
     units,
+    q_inf,
 ):
-    if boundary_layer_voxels is None or boundary_layer_voxels.size == 0:
-        return 0.0, 0.0
+    """Compute forces from pressure coefficient field on airfoil surface.
 
-    sample_pressure = pressure_field[
+    Uses pressure coefficient (C_p) for proper aerodynamic force calculation:
+    F = sum(C_p * q_inf * dA * normal)
+
+    Args:
+        pressure_coefficient_field: Dimensionless pressure coefficient field
+        boundary_layer_voxels: Boundary voxel coordinates and surface normals
+        units: Unit converter with grid spacing dx
+        q_inf: Dynamic pressure (0.5 * rho * V^2)
+
+    Returns:
+        Force vector [F_x, F_y] in N/m (force per unit depth for 2D simulations)
+    """
+    if boundary_layer_voxels is None or boundary_layer_voxels.size == 0:
+        return np.array([0.0, 0.0])
+
+    sample_cp = pressure_coefficient_field[
         boundary_layer_voxels[:, 0].astype(np.int32),
         boundary_layer_voxels[:, 1].astype(np.int32),
     ]
 
-    # Assume each voxel represents a small area of the airfoil surface.
-    voxel_area = units.dx  # For 2D, this is area per unit depth (N/m).
-    force_per_voxel = sample_pressure * voxel_area
+    # For 2D simulations: force per voxel = C_p * q_inf * ds (per unit depth)
+    # ds is the surface element length (arc length / num_voxels), normalized in chord units
+    # Multiply by chord_length to get physical ds
+    ds_chord = (
+        boundary_layer_voxels[:, 7].astype(np.float32)
+        if boundary_layer_voxels.shape[1] > 7
+        else units.dx
+    )
+    surface_element_area = (
+        ds_chord * units.chord_m
+    )  # Convert from normalized to physical length
+
+    force_per_voxel = sample_cp * q_inf * surface_element_area
     normal_x = boundary_layer_voxels[:, 5].astype(np.float32)
     normal_y = boundary_layer_voxels[:, 6].astype(np.float32)
 
@@ -838,24 +788,12 @@ def compute_forces_from_boundary_voxels(
     return force
 
 
-def compute_lift_drag_coefficients(force, airfoil_angle_deg, units):
+def compute_lift_drag_coefficients(force, units):
     force = np.asarray(force, dtype=np.float32)
-    if airfoil_angle_deg is None:
-        airfoil_angle_deg = 0.0
     q_inf = 0.5 * units.rho_ref_kgm3 * units.wind_speed_mps**2
     chord_length = units.chord_m
-    force_x = force[0]
-    force_y = force[1]
-    force_x_aligned = force_x * np.cos(
-        np.deg2rad(airfoil_angle_deg)
-    ) + force_y * np.sin(np.deg2rad(airfoil_angle_deg))
-    force_y_aligned = -force_x * np.sin(
-        np.deg2rad(airfoil_angle_deg)
-    ) + force_y * np.cos(
-        np.deg2rad(airfoil_angle_deg)
-    )  # Rotate forces to align with freestream
 
-    lift_coefficient = force_y_aligned / (q_inf * chord_length)
-    drag_coefficient = force_x_aligned / (q_inf * chord_length)
+    drag_coefficient = force[0] / (q_inf * chord_length)
+    lift_coefficient = force[1] / (q_inf * chord_length)
 
     return lift_coefficient, drag_coefficient

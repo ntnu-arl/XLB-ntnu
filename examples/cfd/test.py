@@ -140,6 +140,63 @@ def visualize_boundary_voxel_normals(
     return fig, ax
 
 
+def visualize_solid_and_boundary_voxels(
+    solid_voxels,
+    boundary_voxels,
+    title="Solid and boundary voxel indices",
+):
+    """Visualize solid obstacle cells and boundary-adjacent cells."""
+
+    def _as_xy(indices, name):
+        array = np.asarray(indices)
+        if array.size == 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(f"{name} must be shaped like [2, N] or [N, 2].")
+        if array.shape[0] == 2:
+            return array[0].astype(np.float32) + 0.5, array[1].astype(np.float32) + 0.5
+        if array.shape[1] == 2:
+            return (
+                array[:, 0].astype(np.float32) + 0.5,
+                array[:, 1].astype(np.float32) + 0.5,
+            )
+        raise ValueError(f"{name} must be shaped like [2, N] or [N, 2].")
+
+    solid_x, solid_y = _as_xy(solid_voxels, "solid_voxels")
+    boundary_x, boundary_y = _as_xy(boundary_voxels, "boundary_voxels")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if solid_x.size > 0:
+        ax.scatter(
+            solid_x,
+            solid_y,
+            s=8,
+            c="#1a202c",
+            alpha=0.45,
+            linewidths=0,
+            label="Solid voxels",
+        )
+    if boundary_x.size > 0:
+        ax.scatter(
+            boundary_x,
+            boundary_y,
+            s=18,
+            c="#d69e2e",
+            alpha=0.9,
+            linewidths=0,
+            label="Boundary voxels",
+        )
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    ax.set_xlabel("x (grid cells)")
+    ax.set_ylabel("y (grid cells)")
+    ax.set_title(title)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig, ax
+
+
 if __name__ == "__main__":
     from helpers import (
         LBUnitConverter,
@@ -181,7 +238,7 @@ if __name__ == "__main__":
     grid = grid_factory(grid_shape, compute_backend=compute_backend)
 
     # Build airfoil obstacle indices
-    _, airfoil_indices, voxels = build_airfoil_indices(
+    solid_indices, boundary_indices, airfoil_indices, voxels = build_airfoil_indices(
         grid_shape=grid_shape,
         chord_fraction=airfoil_chord_length / domain_length_m,
         thickness=airfoil_thickness,
@@ -191,6 +248,14 @@ if __name__ == "__main__":
         x_position=airfoil_x_position,
         y_position=airfoil_y_position,
     )
+
+    # Visualize solid voxels and boundary voxels
+    fig, ax = visualize_solid_and_boundary_voxels(
+        solid_voxels=solid_indices,
+        boundary_voxels=boundary_indices,
+        title="Airfoil solid voxels and boundary voxels",
+    )
+    plt.show()
 
     # Visualize boundary voxels and normals
     fig, ax = visualize_boundary_voxel_normals(
