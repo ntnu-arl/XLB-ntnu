@@ -393,9 +393,8 @@ def _extract_windtunnel_diagnostics(
     rho = rho[:, 1:-1, 1:-1, 0]
     u = u[:, 1:-1, 1:-1, 0]
 
-    print(rho.mean(), rho.min(), rho.max())
-
     flowfield = _to_numpy(units.to_si_velocity(jnp.sqrt(u[0] ** 2 + u[1] ** 2)))
+    # flowfield = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0)) * 100
 
     wind_speed_mps = units.wind_speed_mps
     if wind_speed_mps is None:
@@ -406,7 +405,6 @@ def _extract_windtunnel_diagnostics(
     q_inf = 0.5 * units.rho_ref_kgm3 * wind_speed_mps**2
     pressure = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0))
     pressure_coefficient = np.asarray(pressure / q_inf)
-    pressure_coefficient -= pressure_coefficient.mean()
 
     if boundary_layer_voxels is None:
         return flowfield, None, None
@@ -642,8 +640,7 @@ class WindTunnelDashboard:
         vmin = min(self.flow_scaling[0], float(np.min(finite_values)))
         self.flow_scaling[0] = vmin * 0.99
         self.flow_scaling[1] = vmax * 0.99
-        padding = max(0.05 * (vmax - vmin), 0.05)
-        self.flow_image.setLevels((vmin - padding, vmax + padding))
+        self.flow_image.setLevels((vmin, vmax))
 
     def _update_pressure_range(self, upper_cp, lower_cp):
         finite_values = np.concatenate(

@@ -19,7 +19,6 @@ from xlb.operator.boundary_condition import (
     DoNothingBC,
 )
 
-from xlb.operator.force.momentum_transfer import MomentumTransfer
 from xlb.operator.macroscopic import Macroscopic
 
 from helpers import (
@@ -29,14 +28,14 @@ from helpers import (
 )
 
 # Simulation Configuration
-grid_shape = (900, 1500)
+grid_shape = (800, 1300)
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
 velocity_set = D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)
 
-domain_length_m = 0.8  # Physical domain size in meters (length x height)
-Re = 1e5
+domain_length_m = 0.6  # Physical domain size in meters (length x height)
+Re = 1e6
 air_kinematic_viscosity_m2ps = 1.511e-5
 sim_time = 5.0  # Total simulation time in seconds
 print_interval = 10000
@@ -46,11 +45,11 @@ eval_start_step = 20000
 # Airfoil obstacle parameters (NACA 4-digit style)
 airfoil_chord_length = 0.2  # m
 airfoil_thickness = 0.1
-airfoil_camber = 0.02
+airfoil_camber = 0.1
 airfoil_camber_position = 0.40
-airfoil_angle_deg = -10.0
+airfoil_angle_deg = -5.0
 airfoil_x_position = 0.3
-airfoil_y_position = 0.5
+airfoil_y_position = 0.6
 
 units = LBUnitConverter(
     grid_shape=grid_shape,
@@ -122,7 +121,14 @@ bc_inlet = RegularizedBC(
     prescribed_value=(units.u_lb_inlet, 0.0),
     indices=inlet,
 )
-bc_outlet = ExtrapolationOutflowBC(indices=outlet)
+# bc_outlet = ExtrapolationOutflowBC(
+#     indices=outlet,
+# )
+bc_outlet = RegularizedBC(
+    "pressure",
+    prescribed_value=(-1.0, 0.0),
+    indices=outlet,
+)
 bc_walls = FullwayBounceBackBC(indices=walls)
 bc_obstacle = HalfwayBounceBackBC(indices=obstacle)
 
