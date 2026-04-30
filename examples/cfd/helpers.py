@@ -401,8 +401,10 @@ def _extract_windtunnel_diagnostics(
         raise ValueError(
             "units.wind_speed_mps must be set before extracting diagnostics."
         )
-
+    
+    q_dyn = 0.5 * units.rho_ref_kgm3 * units.to_si_velocity(u[0] ** 2 + u[1] ** 2)
     q_inf = 0.5 * units.rho_ref_kgm3 * wind_speed_mps**2
+
     pressure = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0))
     pressure_coefficient = np.asarray(pressure / q_inf)
 
@@ -449,7 +451,7 @@ class WindTunnelDashboard:
         _require_pyqtgraph()
         self.app = pg.mkQApp("XLB Wind Tunnel Dashboard")
         self.window = pg.GraphicsLayoutWidget(title="XLB Wind Tunnel Dashboard")
-        self.window.resize(2000, 1000)
+        self.window.resize(1500, 700)
         self.flowfield_shape = tuple(flowfield_shape)
         self.voxel_size = voxel_size
         self.flow_scaling = np.zeros(2, dtype=np.float32)
@@ -696,11 +698,14 @@ def _get_dashboard(flowfield_shape, voxel_size, flow_vmax):
 def post_process(
     step,
     f_0,
+    f_1,
     macro,
+    momentum_transfer,
+    missing_mask,
+    bc_mask,
+    boundary_layer_voxels,
+    airfoil_angle_deg,
     units,
-    obstacle_indices=None,
-    boundary_layer_voxels=None,
-    airfoil_angle_deg=None,
 ):
     flowfield, pressure_profile, force = _extract_windtunnel_diagnostics(
         f_0,
@@ -709,7 +714,10 @@ def post_process(
         boundary_layer_voxels=boundary_layer_voxels,
     )
 
-    lift_coefficient, drag_coefficient = compute_lift_drag_coefficients(force, units)
+    # lift_coefficient, drag_coefficient = compute_lift_drag_coefficients(force, units)
+    lift_coefficient, drag_coefficient = compute_lift_drag_coefficients_from_momentum_transfer(
+        f_0, f_1, bc_mask, missing_mask, momentum_transfer, units
+    )
 
     dashboard = _get_dashboard(
         flowfield_shape=flowfield.shape,
@@ -794,3 +802,19 @@ def compute_lift_drag_coefficients(force, units):
     lift_coefficient = force[1] / (q_inf * chord_length)
 
     return lift_coefficient, drag_coefficient
+
+def compute_lift_drag_coefficients_from_momentum_transfer(
+    f_0,
+    f_1,
+    bc_mask,
+    missing_mask,
+    momentum_transfer,
+    units,
+):
+    # Compute lift and drag
+    boundary_force = momentum_transfer(f_0, f_1, bc_mask, missing_mask)
+    drag = boundary_force[0]  # x-direction
+    lift = boundary_force[1]
+    cd = 2.0 * drag *units.dx / (units.u_lb_inlet**2 * units.chord_m)
+    cl = 2.0 * lift *units.dx / (units.u_lb_inlet**2 * units.chord_m)
+    return cl, cd

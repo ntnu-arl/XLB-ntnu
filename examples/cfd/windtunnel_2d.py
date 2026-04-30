@@ -20,6 +20,7 @@ from xlb.operator.boundary_condition import (
 )
 
 from xlb.operator.macroscopic import Macroscopic
+from xlb.operator.force.momentum_transfer import MomentumTransfer
 
 from helpers import (
     LBUnitConverter,
@@ -28,7 +29,7 @@ from helpers import (
 )
 
 # Simulation Configuration
-grid_shape = (800, 1300)
+grid_shape = (200, 400)
 compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 
@@ -44,9 +45,9 @@ eval_start_step = 20000
 
 # Airfoil obstacle parameters (NACA 4-digit style)
 airfoil_chord_length = 0.2  # m
-airfoil_thickness = 0.1
-airfoil_camber = 0.1
-airfoil_camber_position = 0.40
+airfoil_thickness = 0.12
+airfoil_camber = 0.06
+airfoil_camber_position = 0.415
 airfoil_angle_deg = -5.0
 airfoil_x_position = 0.3
 airfoil_y_position = 0.6
@@ -144,7 +145,7 @@ stepper = IncompressibleNavierStokesStepper(
 f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
 
 # Setup Momentum Transfer for Force Calculation
-
+momentum_transfer = MomentumTransfer(bc_obstacle, compute_backend=compute_backend)
 macro = Macroscopic(
     compute_backend=ComputeBackend.JAX,
     precision_policy=precision_policy,
@@ -172,11 +173,14 @@ for _T in range(int(sim_time / units.dt)):
         post_process(
             step=_T,
             f_0=f_0,
+            f_1=f_1,
             macro=macro,
-            units=units,
-            obstacle_indices=obstacle,
+            momentum_transfer=momentum_transfer,
+            missing_mask=missing_mask,
+            bc_mask=bc_mask,
             boundary_layer_voxels=obstacle_boundary_voxels,
             airfoil_angle_deg=airfoil_angle_deg,
+            units=units,
         )
 
 
