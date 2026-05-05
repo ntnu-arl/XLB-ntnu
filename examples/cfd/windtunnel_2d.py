@@ -23,165 +23,177 @@ from xlb.operator.macroscopic import Macroscopic
 from xlb.operator.force.momentum_transfer import MomentumTransfer
 
 from helpers import (
+    AsyncWindTunnelDashboard,
     LBUnitConverter,
     build_airfoil_indices,
     post_process,
 )
 
-# Simulation Configuration
-grid_shape = (200, 400)
-compute_backend = ComputeBackend.WARP
-precision_policy = PrecisionPolicy.FP32FP32
+def main():
+    # Simulation Configuration
+    grid_shape = (2000, 1000)
+    compute_backend = ComputeBackend.WARP
+    precision_policy = PrecisionPolicy.FP32FP32
 
-velocity_set = D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)
+    velocity_set = D2Q9(
+        precision_policy=precision_policy, compute_backend=compute_backend
+    )
 
-domain_length_m = 0.6  # Physical domain size in meters (length x height)
-Re = 1e6
-air_kinematic_viscosity_m2ps = 1.511e-5
-sim_time = 5.0  # Total simulation time in seconds
-print_interval = 10000
-output_interval = 100
-eval_start_step = 20000
+    domain_length_m = 0.5  # Physical domain size in meters (length x height)
+    Re = 1e4
+    air_kinematic_viscosity_m2ps = 1.511e-5
+    sim_time = 50.0  # Total simulation time in seconds
+    print_interval = 10000
+    output_interval = 100
 
-# Airfoil obstacle parameters (NACA 4-digit style)
-airfoil_chord_length = 0.2  # m
-airfoil_thickness = 0.12
-airfoil_camber = 0.06
-airfoil_camber_position = 0.415
-airfoil_angle_deg = -5.0
-airfoil_x_position = 0.3
-airfoil_y_position = 0.6
+    # Airfoil obstacle parameters (NACA 4-digit style)
+    airfoil_chord_length = 0.13  # m
+    airfoil_thickness = 0.12
+    airfoil_camber = 0.06
+    airfoil_camber_position = 0.415
+    airfoil_angle_deg = -5.0
+    airfoil_x_position = 0.3
+    airfoil_y_position = 0.5
 
-units = LBUnitConverter(
-    grid_shape=grid_shape,
-    domain_length_m=domain_length_m,
-    wind_speed_mps=None,
-    chord_fraction=airfoil_chord_length / domain_length_m,
-    reynolds_number=Re,
-    nu_m2ps=air_kinematic_viscosity_m2ps,
-)
+    units = LBUnitConverter(
+        grid_shape=grid_shape,
+        domain_length_m=domain_length_m,
+        wind_speed_mps=None,
+        chord_fraction=airfoil_chord_length / domain_length_m,
+        reynolds_number=Re,
+        nu_m2ps=air_kinematic_viscosity_m2ps,
+    )
 
-voxel_size = units.dx
-clength = units.chord_m
-wind_speed_mps = units.wind_speed_mps
-visc = units.nu_m2ps
-omega = units.omega
+    assert units.wind_speed_mps is not None
 
-# Print simulation info
-print("\n" + "=" * 50 + "\n")
-print("Simulation Configuration:")
-print(f"Grid size: {grid_shape[0]} x {grid_shape[1]}")
-print(f"Grid dimensions: {grid_shape[0]*voxel_size} x {grid_shape[1]*voxel_size}")
-print(f"Number of cells: {grid_shape[0]*grid_shape[1]}")
-print(f"Backend: {compute_backend}")
-print(f"Velocity set: {velocity_set}")
-print(f"Precision policy: {precision_policy}")
-print(f"Domain length [m]: {domain_length_m}")
-print(f"Grid spacing dx [m]: {units.dx}")
-print(f"Time step dt [s]: {units.dt}")
-print(f"Kinematic viscosity nu [m^2/s]: {visc}")
-print(f"Reynolds number: {Re}")
-print(f"Computed freestream velocity [m/s]: {wind_speed_mps}")
-print(f"Lattice inlet velocity u_lb: {units.u_lb_inlet}")
-print(f"Lattice viscosity nu_lb: {units.nu_lb}")
-print(f"Relaxation time tau: {units.tau}")
-print(f"Relaxation factor omega: {omega}")
-print(f"Mach number estimate: {units.ma}")
-print(f"Max iterations: {sim_time/units.dt}")
-print("\n" + "=" * 50 + "\n")
+    voxel_size = units.dx
+    clength = units.chord_m
+    wind_speed_mps = units.wind_speed_mps
+    visc = units.nu_m2ps
+    omega = units.omega
 
-xlb.init(
-    velocity_set=velocity_set,
-    default_backend=compute_backend,
-    default_precision_policy=precision_policy,
-)
+    # Print simulation info
+    print("\n" + "=" * 50 + "\n")
+    print("Simulation Configuration:")
+    print(f"Grid size: {grid_shape[0]} x {grid_shape[1]}")
+    print(f"Grid dimensions: {grid_shape[0]*voxel_size} x {grid_shape[1]*voxel_size}")
+    print(f"Number of cells: {grid_shape[0]*grid_shape[1]}")
+    print(f"Backend: {compute_backend}")
+    print(f"Velocity set: {velocity_set}")
+    print(f"Precision policy: {precision_policy}")
+    print(f"Domain length [m]: {domain_length_m}")
+    print(f"Grid spacing dx [m]: {units.dx}")
+    print(f"Time step dt [s]: {units.dt}")
+    print(f"Kinematic viscosity nu [m^2/s]: {visc}")
+    print(f"Reynolds number: {Re}")
+    print(f"Computed freestream velocity [m/s]: {wind_speed_mps}")
+    print(f"Lattice inlet velocity u_lb: {units.u_lb_inlet}")
+    print(f"Lattice viscosity nu_lb: {units.nu_lb}")
+    print(f"Relaxation time tau: {units.tau}")
+    print(f"Relaxation factor omega: {omega}")
+    print(f"Mach number estimate: {units.ma}")
+    print(f"Max iterations: {sim_time/units.dt}")
+    print("\n" + "=" * 50 + "\n")
 
-grid = grid_factory(grid_shape, compute_backend=compute_backend)
+    xlb.init(
+        velocity_set=velocity_set,
+        default_backend=compute_backend,
+        default_precision_policy=precision_policy,
+    )
 
-box = grid.bounding_box_indices()
-box_no_edge = grid.bounding_box_indices(remove_edges=True)
-inlet = box_no_edge["left"]
-outlet = box_no_edge["right"]
-walls = [box["bottom"][i] + box["top"][i] for i in range(velocity_set.d)]
-walls = np.unique(np.array(walls), axis=-1).tolist()
+    grid = grid_factory(grid_shape, compute_backend=compute_backend)
 
-obstacle, obstacle_boundary_layer, obstacle_boundary_voxels = build_airfoil_indices(
-    grid_shape,
-    chord_fraction=airfoil_chord_length / domain_length_m,
-    thickness=airfoil_thickness,
-    camber=airfoil_camber,
-    camber_position=airfoil_camber_position,
-    angle_deg=airfoil_angle_deg,
-    x_position=airfoil_x_position,
-    y_position=airfoil_y_position,
-)
+    box = grid.bounding_box_indices()
+    box_no_edge = grid.bounding_box_indices(remove_edges=True)
+    inlet = box_no_edge["left"]
+    outlet = box_no_edge["right"]
+    walls = [box["bottom"][i] + box["top"][i] for i in range(velocity_set.d)]
+    walls = np.unique(np.array(walls), axis=-1).tolist()
+
+    obstacle, obstacle_boundary_layer, obstacle_boundary_voxels = build_airfoil_indices(
+        grid_shape,
+        chord_fraction=airfoil_chord_length / domain_length_m,
+        thickness=airfoil_thickness,
+        camber=airfoil_camber,
+        camber_position=airfoil_camber_position,
+        angle_deg=airfoil_angle_deg,
+        x_position=airfoil_x_position,
+        y_position=airfoil_y_position,
+    )
+
+    bc_inlet = RegularizedBC(
+        "velocity",
+        prescribed_value=(units.u_lb_inlet, 0.0),
+        indices=inlet,
+    )
+    bc_outlet = ExtrapolationOutflowBC(
+        indices=outlet,
+    )
+    bc_walls = FullwayBounceBackBC(indices=walls)
+
+    bc_obstacle = HalfwayBounceBackBC(indices=obstacle)
+
+    boundary_conditions = [bc_inlet, bc_outlet, bc_walls, bc_obstacle]
+
+    stepper = IncompressibleNavierStokesStepper(
+        grid=grid,
+        boundary_conditions=boundary_conditions,
+        collision_type="KBC",
+    )
+
+    f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
+
+    # Setup Momentum Transfer for Force Calculation
+    momentum_transfer = MomentumTransfer(bc_obstacle, compute_backend=compute_backend)
+    macro = Macroscopic(
+        compute_backend=compute_backend,
+        precision_policy=precision_policy,
+        velocity_set=D2Q9(
+            precision_policy=precision_policy, compute_backend=compute_backend
+        ),
+    )
+
+    dashboard = AsyncWindTunnelDashboard(
+        flowfield_shape=grid_shape,
+        voxel_size=units.dx,
+        flow_vmax=wind_speed_mps * 1.5,
+    )
+
+    start_time = time.time()
+
+    try:
+        for _T in range(int(sim_time / units.dt)):
+
+            f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, omega, _T)
+            f_0, f_1 = f_1, f_0
+
+            if _T % print_interval == 0:
+                if compute_backend == ComputeBackend.WARP:
+                    wp.synchronize()
+                elapsed_time = time.time() - start_time
+                print(
+                    f"Iteration: {_T*units.dt:0.2f}/{sim_time} | Time elapsed: {elapsed_time:.2f}s"
+                )
+                start_time = time.time()
+            if _T % output_interval == 0:
+                post_process(
+                    step=_T,
+                    f_0=f_0,
+                    f_1=f_1,
+                    macro=macro,
+                    momentum_transfer=momentum_transfer,
+                    missing_mask=missing_mask,
+                    bc_mask=bc_mask,
+                    boundary_layer_voxels=obstacle_boundary_voxels,
+                    airfoil_angle_deg=airfoil_angle_deg,
+                    units=units,
+                    dashboard=dashboard,
+                )
+    finally:
+        dashboard.close()
+
+    print("Simulation completed successfully.")
 
 
-bc_inlet = RegularizedBC(
-    "velocity",
-    prescribed_value=(units.u_lb_inlet, 0.0),
-    indices=inlet,
-)
-# bc_outlet = ExtrapolationOutflowBC(
-#     indices=outlet,
-# )
-bc_outlet = RegularizedBC(
-    "pressure",
-    prescribed_value=(-1.0, 0.0),
-    indices=outlet,
-)
-bc_walls = FullwayBounceBackBC(indices=walls)
-bc_obstacle = HalfwayBounceBackBC(indices=obstacle)
-
-
-boundary_conditions = [bc_inlet, bc_outlet, bc_walls, bc_obstacle]
-
-stepper = IncompressibleNavierStokesStepper(
-    grid=grid,
-    boundary_conditions=boundary_conditions,
-    collision_type="KBC",
-)
-
-f_0, f_1, bc_mask, missing_mask = stepper.prepare_fields()
-
-# Setup Momentum Transfer for Force Calculation
-momentum_transfer = MomentumTransfer(bc_obstacle, compute_backend=compute_backend)
-macro = Macroscopic(
-    compute_backend=ComputeBackend.JAX,
-    precision_policy=precision_policy,
-    velocity_set=D2Q9(
-        precision_policy=precision_policy, compute_backend=ComputeBackend.JAX
-    ),
-)
-
-start_time = time.time()
-
-for _T in range(int(sim_time / units.dt)):
-
-    f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, omega, _T)
-    f_0, f_1 = f_1, f_0
-
-    if _T % print_interval == 0:
-        if compute_backend == ComputeBackend.WARP:
-            wp.synchronize()
-        elapsed_time = time.time() - start_time
-        print(
-            f"Iteration: {_T*units.dt:0.2f}/{sim_time} | Time elapsed: {elapsed_time:.2f}s"
-        )
-        start_time = time.time()
-    if _T % output_interval == 0:
-        post_process(
-            step=_T,
-            f_0=f_0,
-            f_1=f_1,
-            macro=macro,
-            momentum_transfer=momentum_transfer,
-            missing_mask=missing_mask,
-            bc_mask=bc_mask,
-            boundary_layer_voxels=obstacle_boundary_voxels,
-            airfoil_angle_deg=airfoil_angle_deg,
-            units=units,
-        )
-
-
-print("Simulation completed successfully.")
+if __name__ == "__main__":
+    main()

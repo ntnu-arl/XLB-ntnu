@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import atexit
 import importlib
+import multiprocessing as mp
+import queue as queue_module
 import numpy as np
 import jax.numpy as jnp
 import warp as wp
@@ -102,7 +105,6 @@ class LBUnitConverter:
 
 
 # -------------------------- Helper Functions --------------------------
-
 
 def build_airfoil_indices(
     grid_shape,
@@ -355,18 +357,6 @@ def _require_pyqtgraph():
             "pyqtgraph is not available. Install pyqtgraph and PySide6 to use live plotting."
         )
 
-
-def _to_numpy(array):
-    if isinstance(array, np.ndarray):
-        return array
-    if isinstance(array, jnp.ndarray):
-        return np.asarray(array)
-    try:
-        return np.asarray(wp.to_jax(array))
-    except Exception:
-        return np.asarray(array)
-
-
 def _normalize_boundary_layer_voxels(boundary_layer_voxels):
     if boundary_layer_voxels is None:
         return np.empty((0, 8), dtype=np.float32)
@@ -384,16 +374,20 @@ def _normalize_boundary_layer_voxels(boundary_layer_voxels):
 def _extract_windtunnel_diagnostics(
     f_0, macro, units: LBUnitConverter, boundary_layer_voxels=None
 ):
-    if not isinstance(f_0, jnp.ndarray):
-        f_0_jax = wp.to_jax(f_0)
-    else:
-        f_0_jax = f_0
+    global rho_wp, u_wp
+    if "rho_wp" not in globals() or "u_wp" not in globals():
+        print("Initializing diagnostic buffers...")
+        rho_wp = wp.zeros((1, f_0.shape[1], f_0.shape[2], f_0.shape[3]), dtype=wp.float32)
+        u_wp = wp.zeros((2, f_0.shape[1], f_0.shape[2], f_0.shape[3]), dtype=wp.float32)
 
-    rho, u = macro(f_0_jax)
-    rho = rho[:, 1:-1, 1:-1, 0]
-    u = u[:, 1:-1, 1:-1, 0]
+    rho_wp, u_wp = macro(f_0, rho_wp, u_wp)
 
-    flowfield = _to_numpy(units.to_si_velocity(jnp.sqrt(u[0] ** 2 + u[1] ** 2)))
+    rho = np.asarray(wp.to_jax(rho_wp)[:,1:-1,1:-1,0])  # Remove halo and extract scalar density
+    u = np.asarray(wp.to_jax(u_wp)[:,1:-1,1:-1,0])  # Remove halo and extract scalar density
+
+    #print(rho.sum()/rho.size)
+
+    flowfield = units.to_si_velocity(np.sqrt(np.pow(u[0], 2) + np.pow(u[1], 2)))
     # flowfield = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0)) * 100
 
     wind_speed_mps = units.wind_speed_mps
@@ -405,7 +399,7 @@ def _extract_windtunnel_diagnostics(
     q_dyn = 0.5 * units.rho_ref_kgm3 * units.to_si_velocity(u[0] ** 2 + u[1] ** 2)
     q_inf = 0.5 * units.rho_ref_kgm3 * wind_speed_mps**2
 
-    pressure = _to_numpy(units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0))
+    pressure = units.pressure_fluctuation_to_si(rho[0], rho_lb0=1.0)
     pressure_coefficient = np.asarray(pressure / q_inf)
 
     if boundary_layer_voxels is None:
@@ -549,14 +543,13 @@ class WindTunnelDashboard:
     def update(
         self,
         step,
-        flowfield,
+        flowfield_np,
         pressure_profile=None,
         boundary_layer_voxels=None,
         airfoil_angle_deg=None,
         drag_coefficient=None,
         lift_coefficient=None,
     ):
-        flowfield_np = _to_numpy(flowfield)
         if flowfield_np.ndim != 2:
             raise ValueError("flowfield must be a 2D array of velocity magnitudes.")
 
@@ -681,6 +674,102 @@ class WindTunnelDashboard:
         )
 
 
+def _dashboard_process_main(message_queue, stop_event, flowfield_shape, voxel_size):
+    dashboard = WindTunnelDashboard(
+        flowfield_shape=flowfield_shape,
+        voxel_size=voxel_size,
+    )
+    try:
+        while not stop_event.is_set():
+            try:
+                payload = message_queue.get(timeout=0.1)
+            except queue_module.Empty:
+                dashboard.app.processEvents()
+                continue
+
+            if payload is None:
+                break
+
+            dashboard.update(**payload)
+    finally:
+        dashboard.app.processEvents()
+
+
+class AsyncWindTunnelDashboard:
+    def __init__(self, flowfield_shape, voxel_size, flow_vmax=None):
+        ctx = mp.get_context("spawn")
+        self._queue = ctx.Queue(maxsize=1)
+        self._stop_event = ctx.Event()
+        self._process = ctx.Process(
+            target=_dashboard_process_main,
+            args=(self._queue, self._stop_event, flowfield_shape, voxel_size),
+            daemon=True,
+        )
+        self._closed = False
+        self._process.start()
+        atexit.register(self.close)
+
+    def update(
+        self,
+        step,
+        flowfield_np,
+        pressure_profile=None,
+        boundary_layer_voxels=None,
+        airfoil_angle_deg=None,
+        drag_coefficient=None,
+        lift_coefficient=None,
+    ):
+        if self._closed:
+            return
+
+        payload = {
+            "step": step,
+            "flowfield_np": flowfield_np,
+            "pressure_profile": pressure_profile,
+            "boundary_layer_voxels": boundary_layer_voxels,
+            "airfoil_angle_deg": airfoil_angle_deg,
+            "drag_coefficient": drag_coefficient,
+            "lift_coefficient": lift_coefficient,
+        }
+
+        try:
+            self._queue.put_nowait(payload)
+        except queue_module.Full:
+            try:
+                self._queue.get_nowait()
+            except queue_module.Empty:
+                pass
+
+            try:
+                self._queue.put_nowait(payload)
+            except queue_module.Full:
+                pass
+
+    def close(self):
+        if self._closed:
+            return
+
+        self._closed = True
+        self._stop_event.set()
+
+        try:
+            self._queue.put_nowait(None)
+        except queue_module.Full:
+            try:
+                self._queue.get_nowait()
+            except queue_module.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue_module.Full:
+                pass
+
+        self._process.join(timeout=2.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=2.0)
+
+
 def _get_dashboard(flowfield_shape, voxel_size, flow_vmax):
     global _WINDTUNNEL_DASHBOARD
     if (
@@ -706,6 +795,7 @@ def post_process(
     boundary_layer_voxels,
     airfoil_angle_deg,
     units,
+    dashboard=None,
 ):
     flowfield, pressure_profile, force = _extract_windtunnel_diagnostics(
         f_0,
@@ -719,14 +809,16 @@ def post_process(
         f_0, f_1, bc_mask, missing_mask, momentum_transfer, units
     )
 
-    dashboard = _get_dashboard(
-        flowfield_shape=flowfield.shape,
-        voxel_size=units.dx,
-        flow_vmax=units.wind_speed_mps * 1.5,
-    )
+    if dashboard is None:
+        dashboard = _get_dashboard(
+            flowfield_shape=flowfield.shape,
+            voxel_size=units.dx,
+            flow_vmax=units.wind_speed_mps * 1.5,
+        )
+
     dashboard.update(
         step=step,
-        flowfield=flowfield,
+        flowfield_np=flowfield,
         pressure_profile=pressure_profile,
         boundary_layer_voxels=boundary_layer_voxels,
         airfoil_angle_deg=airfoil_angle_deg,
