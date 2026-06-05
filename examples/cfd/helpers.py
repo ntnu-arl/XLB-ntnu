@@ -696,7 +696,7 @@ def _dashboard_process_main(message_queue, stop_event, flowfield_shape, voxel_si
 
 
 class AsyncWindTunnelDashboard:
-    def __init__(self, flowfield_shape, voxel_size, flow_vmax=None):
+    def __init__(self, flowfield_shape, voxel_size):
         ctx = mp.get_context("spawn")
         self._queue = ctx.Queue(maxsize=1)
         self._stop_event = ctx.Event()

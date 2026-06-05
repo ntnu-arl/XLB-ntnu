@@ -194,7 +194,7 @@ stl_filename = "./data/Sparrow.stl"
 
 num_steps = 100000
 print_interval = 1000
-post_process_interval = 1
+post_process_interval = 1000
 
 # Physical Parameters
 Re = 80000.0
@@ -277,10 +277,10 @@ mesh.vertices = mesh_vertices
 bc_left = RegularizedBC(
     "velocity", prescribed_value=(wind_speed * voxel_size, 0.0, 0.0), indices=inlet
 )
-bc_walls = FullwayBounceBackBC(indices=walls)
-bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
 bc_mesh = HalfwayBounceBackBC(mesh_vertices=mesh_vertices)
-boundary_conditions = [bc_walls, bc_left, bc_do_nothing, bc_mesh]
+bc_do_nothing = ExtrapolationOutflowBC(indices=outlet)
+bc_walls = FullwayBounceBackBC(indices=walls)
+boundary_conditions = [bc_walls,bc_do_nothing, bc_left, bc_mesh]
 
 # Setup Stepper
 stepper = IncompressibleNavierStokesStepper(

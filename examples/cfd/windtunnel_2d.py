@@ -31,7 +31,7 @@ from helpers import (
 
 def main():
     # Simulation Configuration
-    grid_shape = (2000, 1000)
+    grid_shape = (3000, 2000)
     compute_backend = ComputeBackend.WARP
     precision_policy = PrecisionPolicy.FP32FP32
 
@@ -39,8 +39,8 @@ def main():
         precision_policy=precision_policy, compute_backend=compute_backend
     )
 
-    domain_length_m = 0.5  # Physical domain size in meters (length x height)
-    Re = 1e4
+    domain_length_m = 0.6  # Physical domain size in meters (length x height)
+    Re = 1e5
     air_kinematic_viscosity_m2ps = 1.511e-5
     sim_time = 50.0  # Total simulation time in seconds
     print_interval = 10000
@@ -49,7 +49,7 @@ def main():
     # Airfoil obstacle parameters (NACA 4-digit style)
     airfoil_chord_length = 0.13  # m
     airfoil_thickness = 0.12
-    airfoil_camber = 0.06
+    airfoil_camber = 0.1
     airfoil_camber_position = 0.415
     airfoil_angle_deg = -5.0
     airfoil_x_position = 0.3
@@ -148,15 +148,12 @@ def main():
     macro = Macroscopic(
         compute_backend=compute_backend,
         precision_policy=precision_policy,
-        velocity_set=D2Q9(
-            precision_policy=precision_policy, compute_backend=compute_backend
-        ),
+        velocity_set=velocity_set,
     )
 
     dashboard = AsyncWindTunnelDashboard(
         flowfield_shape=grid_shape,
         voxel_size=units.dx,
-        flow_vmax=wind_speed_mps * 1.5,
     )
 
     start_time = time.time()
